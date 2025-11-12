@@ -101,7 +101,8 @@ In a new terminal:
 ```bash
 roslaunch dvrk_video gscam_v4l.launch \
   device:=/dev/video[X] \
-  camera_name:=endopsm1
+  camera_name:=endopsm1 \
+  images_per_second:=30 
 ```
 
 **Note:** Replace `[X]` with the actual video device number (e.g., `/dev/video0`)
@@ -112,7 +113,8 @@ In a new terminal:
 ```bash
 roslaunch dvrk_video gscam_v4l.launch \
   device:=/dev/video[Y] \
-  camera_name:=endopsm2
+  camera_name:=endopsm2 \
+  images_per_second:=30
 ```
 
 **Note:** Replace `[Y]` with the actual video device number (e.g., `/dev/video2`)
