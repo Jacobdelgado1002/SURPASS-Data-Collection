@@ -64,7 +64,14 @@ rosrun dvrk_camera_registration vis_gripper_pose.py \
 
 ### Starting the dVRK System
 
-After completing the IRL setup, launch the main dVRK system:
+### 1. Start ROS Core
+Run in a terminal in computer #1
+```bash
+roscore
+```
+
+### 2. Launch the main dVRK system
+After completing the IRL setup, launch the main dVRK system in computer #2:
 ```bash
 cd catkin_ws_dvrk/src/dvrk/dvrk_config_jhu/jhu-daVinci-Si
 rosrun dvrk_robot dvrk_system \
