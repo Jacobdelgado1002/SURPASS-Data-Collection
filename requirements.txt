@@ -1,0 +1,5 @@
+opencv-python
+numpy
+matplotlib
+pandas
+lerobot==0.3.3
