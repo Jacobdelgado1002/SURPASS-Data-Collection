@@ -38,6 +38,40 @@ except ImportError:
          print("Error: Could not import sync_image_kinematics. Make sure it is in the same directory or python path.")
          sys.exit(1)
 
+def write_filtered_kinematics(
+    dest_episode_dir: Path,
+    sync_df: pd.DataFrame,
+    validation: Dict[str, Any],
+    kept_filenames: List[str],
+) -> None:
+    """Write filtered kinematics CSV corresponding to kept image filenames.
+
+    Args:
+        dest_episode_dir: Destination episode directory.
+        sync_df: Synchronization DataFrame returned by sync_image_kinematics.
+        validation: Validation dictionary containing original kinematics file path.
+        kept_filenames: List of left-camera filenames that were kept.
+    """
+    if sync_df.empty:
+        return
+
+    kept_set = set(kept_filenames)
+    mask = sync_df['image_filename'].isin(kept_set)
+    final_sync_df = sync_df[mask]
+
+    if final_sync_df.empty:
+        return
+
+    # Preserve 1-to-1 mapping (allow duplicates)
+    kinematics_indices = final_sync_df['kinematics_idx'].values
+
+    original_kinematics = pd.read_csv(validation['kinematics_file'])
+
+    filtered_kinematics = original_kinematics.loc[kinematics_indices].copy()
+    filtered_kinematics.reset_index(drop=True, inplace=True)
+
+    dest_csv = dest_episode_dir / "ee_csv.csv"
+    filtered_kinematics.to_csv(dest_csv, index=False)
 
 def find_episodes(source_dir: Union[str, Path]) -> List[Path]:
     """Recursively finds all directories containing valid data.
@@ -157,7 +191,7 @@ def copy_filtered_episode(
         max_time_diff: Maximum time difference for sync in milliseconds.
 
     Returns:
-        True if copy was successful, False otherwise.
+        True if at least one fully synchronized frame was copied, False otherwise.
     """
     try:
         # Preserve relative path under destination
@@ -321,34 +355,18 @@ def copy_filtered_episode(
         # sync_result['sync_df'] contains the filtered results for the left camera.
         # We need to filter it further to only include 'fully_valid_frames'
         
-        kept_filenames_set = set([x[0] for x in fully_valid_frames])
-        
-        sync_df = sync_result['sync_df']
-        if not sync_df.empty:
-            # Filter sync_df to only include rows where 'image_filename' is in kept_set
-            mask = sync_df['image_filename'].isin(kept_filenames_set)
-            final_sync_df = sync_df[mask].copy()
-            
-            if not final_sync_df.empty:
-                # Get the kinematics indices. 
-                # IMPORTANT: Do NOT use .unique(). We want to preserve the 1-to-1 mapping 
-                # between images and kinematics rows. If multiple images map to the same 
-                # kinematics index (e.g. 60Hz video, 30Hz kinematics), we need duplicate rows.
-                valid_kinematics_indices = final_sync_df['kinematics_idx'].values
-                
-                original_kinematics = pd.read_csv(validation['kinematics_file'])
-                
-                # Use .loc[] for label-based indexing to be safe (kinematics_idx are row indices)
-                filtered_kinematics = original_kinematics.loc[valid_kinematics_indices].copy()
-                filtered_kinematics.reset_index(drop=True, inplace=True)
-                
-                dest_kinematics = dest_episode_dir / "ee_csv.csv"
-                filtered_kinematics.to_csv(dest_kinematics, index=False)
+        kept_left_filenames = [x[0] for x in fully_valid_frames]
 
+        write_filtered_kinematics(
+            dest_episode_dir=dest_episode_dir,
+            sync_df=sync_result['sync_df'],
+            validation=validation,
+            kept_filenames=kept_left_filenames,
+        )   
+        
         return True
         
     except Exception as e:
-        # print(f"✗ Failed to copy episode {episode_path.name}: {str(e)}")
         return False
 
 
@@ -496,18 +514,39 @@ def main():
     print("-" * 60)
     
     episodes = find_episodes(str(source_dir))
-    
+    # --- NEW: early filtering to avoid spawning useless processes ---
+    episodes_to_process: List[Path] = []
+    skipped_pre = []
+
+
+    for ep in episodes:
+        try:
+            rel = ep.relative_to(source_dir)
+        except ValueError:
+            rel = Path(ep.name)
+
+        dest_episode_dir = dest_dir / rel
+
+        if dest_episode_dir.exists() and not args.overwrite and not args.dry_run:
+            skipped_pre.append((ep.name, "Destination already exists"))
+            continue
+
+        episodes_to_process.append(ep)
+
+
+    # Update stats early
     stats = {
         'total_episodes': len(episodes),
         'valid_structure': 0,
         'sync_successful': 0,
         'copied_episodes': 0,
         'total_images_copied': 0,
-        'skipped_episodes': []
+        'skipped_episodes': skipped_pre.copy()
     }
     
-    # Process episodes in parallel with progress bar
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
+    # Process episodes in parallel
+    max_procs = min(args.workers or os.cpu_count(), 8)
+    with ProcessPoolExecutor(max_workers=max_procs) as executor:
         futures = {
             executor.submit(
                 process_single_episode, 
@@ -520,7 +559,7 @@ def main():
                 args.dry_run,
                 args.hardlink,
                 args.overwrite
-            ): episode for episode in episodes
+            ): episode for episode in episodes_to_process
         }
         
         # Create progress bar
