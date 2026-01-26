@@ -252,60 +252,7 @@ def copy_or_link(
         return False
 
 
-def copy_episode_files(
-    src_dir: Path,
-    dst_dir: Path,
-    filenames: Sequence[str],
-    workers: int = 8,
-    use_hardlink: bool = False,
-    overwrite: bool = False,
-) -> Tuple[int, int]:
 
-    """Copy (or hardlink) a list of filenames from src_dir into dst_dir in parallel.
-
-    Args:
-        src_dir: Directory containing source files.
-        dst_dir: Target directory where files will be created.
-        filenames: List of basenames to copy.
-        workers: Number of worker threads for parallel copying.
-        use_hardlink: Attempt to hardlink files instead of copying where possible.
-        overwrite: Overwrite destination files if they exist.
-
-    Returns:
-        Tuple (copied_count, missing_count).
-    """
-    ensure_dir(dst_dir)
-    tasks: List[Tuple[Path, Path]] = []
-    for name in filenames:
-        src = src_dir / name
-        dst = dst_dir / name
-        tasks.append((src, dst))
-
-    copied = 0
-    missing = 0
-    # Use threads since IO-bound
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        future_to_pair = {
-            ex.submit(copy_or_link, src, dst, use_hardlink, overwrite): (src, dst) for src, dst in tasks
-        }
-        for fut in as_completed(future_to_pair):
-            src, dst = future_to_pair[fut]
-            try:
-                ok = fut.result()
-            except Exception:
-                ok = False
-            if ok:
-                copied += 1
-            else:
-                # if file missing or failed, count as missing
-                if not src.exists():
-                    missing += 1
-                    logger.debug("Missing source file: %s", src)
-                else:
-                    # failed to copy (permission / disk full / etc.)
-                    missing += 1
-                    logger.warning("Failed to copy file despite existing: %s", src)
-    return copied, missing
 
 
 # --- main orchestration -----------------------------------------------------
@@ -499,9 +446,10 @@ def process_episode(
     psm1_to_copy = get_slice(psm1_files, indices)
     psm2_to_copy = get_slice(psm2_files, indices)
 
-    # 5. Execute Copy
-    copied = 0
-    missing = 0
+    # 5. Execute Copy (Unified ThreadPool for entire episode)
+    # Collect all copy tasks first
+    all_copy_tasks: List[Tuple[Path, Path]] = []
+    
     for s_dir, d_dir, names in (
         (left_src, left_dst, left_to_copy),
         (right_src, right_dst, right_to_copy),
@@ -510,9 +458,35 @@ def process_episode(
     ):
         if not names:
             continue
-        c, m = copy_episode_files(s_dir, d_dir, names, workers=workers, use_hardlink=use_hardlink, overwrite=overwrite)
-        copied += c
-        missing += m
+        ensure_dir(d_dir)
+        for name in names:
+            all_copy_tasks.append((s_dir / name, d_dir / name))
+
+    copied = 0
+    missing = 0
+    
+    # Use one pool for all files in the episode
+    if all_copy_tasks:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_to_pair = {
+                ex.submit(copy_or_link, src, dst, use_hardlink, overwrite): (src, dst) 
+                for src, dst in all_copy_tasks
+            }
+            for fut in as_completed(future_to_pair):
+                src, dst = future_to_pair[fut]
+                try:
+                    ok = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    copied += 1
+                else:
+                    if not src.exists():
+                        missing += 1
+                        logger.debug("Missing source file: %s", src)
+                    else:
+                        missing += 1
+                        logger.warning("Failed to copy file despite existing: %s", src)
 
     # 6. Slice CSV using NEW indices
     ee_rows = 0
