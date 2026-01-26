@@ -64,7 +64,14 @@ rosrun dvrk_camera_registration vis_gripper_pose.py \
 
 ### Starting the dVRK System
 
-After completing the IRL setup, launch the main dVRK system:
+### 1. Start ROS Core
+Run in a terminal in computer #1
+```bash
+roscore
+```
+
+### 2. Launch the main dVRK system
+After completing the IRL setup, launch the main dVRK system in computer #2:
 ```bash
 cd catkin_ws_dvrk/src/dvrk/dvrk_config_jhu/jhu-daVinci-Si
 rosrun dvrk_robot dvrk_system \
@@ -101,7 +108,8 @@ In a new terminal:
 ```bash
 roslaunch dvrk_video gscam_v4l.launch \
   device:=/dev/video[X] \
-  camera_name:=endopsm1
+  camera_name:=endopsm1 \
+  images_per_second:=30 
 ```
 
 **Note:** Replace `[X]` with the actual video device number (e.g., `/dev/video0`)
@@ -112,7 +120,8 @@ In a new terminal:
 ```bash
 roslaunch dvrk_video gscam_v4l.launch \
   device:=/dev/video[Y] \
-  camera_name:=endopsm2
+  camera_name:=endopsm2 \
+  images_per_second:=30
 ```
 
 **Note:** Replace `[Y]` with the actual video device number (e.g., `/dev/video2`)
