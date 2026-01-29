@@ -1,16 +1,16 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-Normalize image frame names in-place to the pattern expected by `dvrk_zarr_to_lerobot.py`:
-    frame000000_left.jpg, frame000001_right.jpg, ...
+Normalize image frame names in-place to sequential 0-indexed patterns.
 
-This script:
-1.  Recursively finds all episodes.
-2.  Renames all images in each camera folder in-place with normalized 0-indexed filenames.
-3.  Uses a two-pass rename strategy (TMP -> Final) to avoid collisions between old and new names.
-4.  Uses parallel processing for speed.
+This script processes dataset episodes and renames all image frames to a standardized
+format: frame000000_left.jpg, frame000001_right.jpg, etc. It uses a two-pass rename
+strategy to avoid filename collisions and supports parallel processing for efficiency.
 
-Usage:
-    python normalize_frame_names.py --data-path data/sliced --workers 12
+Typical usage:
+    python normalize_frame_names.py --data-path dataset_sliced --workers 12
+
+The script is compatible with the action-based slicing structure:
+    dataset_sliced/tissue_N/action_subdir/episode_XXX/
 """
 
 import argparse
@@ -43,9 +43,27 @@ def normalize_episode_inplace(
     episode_path: Path,
     sort_by: str = "name"
 ) -> Tuple[int, int, str]:
-    """
-    Process a single episode: normalize image names in-place.
-    Returns (images_renamed, errors, episode_name).
+    """Normalizes image filenames within a single episode directory.
+
+    This function processes all image subdirectories (left_img_dir, right_img_dir,
+    endo_psm1, endo_psm2) within an episode and renames files to a sequential
+    0-indexed format. Uses a two-pass rename strategy to prevent collisions.
+
+    Args:
+        episode_path: Path to the episode directory containing image subdirectories.
+        sort_by: Sorting criterion for determining frame order. Either 'name' for
+                 lexicographic sorting or 'mtime' for modification time sorting.
+
+    Returns:
+        A tuple containing:
+            - images_renamed: Number of images successfully renamed.
+            - errors: Number of errors encountered during renaming.
+            - episode_name: Name of the episode directory processed.
+
+    Implementation Details:
+        Pass 1: Renames files to temporary UUID-based names to avoid collisions.
+        Pass 2: Renames temporary files to final normalized format (frameNNNNNN_suffix.ext).
+        This ensures correctness even when re-running on partially normalized data.
     """
     images_renamed = 0
     errors = 0
@@ -98,7 +116,21 @@ def normalize_episode_inplace(
 
 
 def find_episodes(root: Path) -> List[Path]:
-    """Recursively find all episode directories (directories containing ee_csv.csv)."""
+    """Recursively discovers all episode directories in the dataset.
+
+    An episode directory is identified by the presence of an 'ee_csv.csv' file,
+    which contains the kinematics data for that episode.
+
+    Args:
+        root: Root directory to search for episodes.
+
+    Returns:
+        Sorted list of Path objects pointing to episode directories.
+
+    Performance:
+        Uses os.walk for efficient traversal of large directory trees (O(n) where
+        n is the total number of directories).
+    """
     episodes = []
     # Using os.walk is faster than recursive glob for large trees
     for dirpath, dirs, files in os.walk(root):
@@ -107,7 +139,12 @@ def find_episodes(root: Path) -> List[Path]:
     return sorted(episodes)
 
 
-def main():
+def main() -> None:
+    """Main entry point for the frame normalization script.
+
+    Parses command-line arguments, discovers episodes, and orchestrates parallel
+    normalization of frame names across all episodes in the dataset.
+    """
     parser = argparse.ArgumentParser(
         description="Normalize filtered dataset frame names in-place for training."
     )

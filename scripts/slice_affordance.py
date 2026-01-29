@@ -2,22 +2,22 @@
 """
 Slice original session data into per-action episodes using affordance_range.
 
-Reads JSON annotations under `post_process/*_left_video/annotation/*.json`,
-finds `affordance_range.start` and `affordance_range.end` (indices relative to the raw footage),
-and creates an output dataset.
+This script reads JSON annotations to identify action intervals and slices the
+corresponding data from a source dataset into organized episodes. It ensures
+semantic consistency by mapping frame indices to timestamps.
 
-Crucially, this script supports slicing a *filtered* or *synchronized* dataset based on annotations
-from the *original* raw dataset. It does this by:
-1.  Looking up the timestamp of the start/end frames in the RAW dataset.
-2.  Finding the corresponding frames in the TARGET dataset that match those timestamps.
-
-This ensures that even if frames were dropped or the frame rate changed, the semantic
-start/end points of the action are preserved.
-
-Structure: out/tissue_<n>/<action>/episode_XXX/{left_img_dir,right_img_dir,endo_psm1,endo_psm2,ee_csv.csv}
-
-Run with `--dry_run` to only list planned operations.
+The output is structured as:
+dataset_sliced/
+  tissue_N/
+    <subtask_action>/
+      episode_XXX/
+        left_img_dir/
+        right_img_dir/
+        endo_psm1/
+        endo_psm2/
+        ee_csv.csv
 """
+
 import argparse
 import csv
 import json
@@ -25,148 +25,165 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from functools import lru_cache
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Iterator, List, Optional, Tuple, Dict, Any, Union
 
 import numpy as np
 from tqdm import tqdm
 
 # Configure top-level logger
-logging.basicConfig(level=logging.INFO, 
-                    format="%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s",
+)
 logger = logging.getLogger("slice_affordance")
 
+# --- Constants ---------------------------------------------------------------
 
-# --- utility helpers ---------------------------------------------------------
 FRAME_RE = re.compile(r"frame(\d+)")
 
-def episode_exists(dst_base: Path) -> bool:
-    """Check whether an episode output directory already exists.
+# Mapping from raw action names in JSON to output subdirectory names
+ACTION_SUBDIRS = {
+    "grasp": "1_grasp",
+    "dissect": "2_dissect",
+}
+
+
+# --- Utility Helpers ---------------------------------------------------------
+
+def ensure_dir(path: Path) -> None:
+    """Creates a directory and its parents if they do not exist.
 
     Args:
-        dst_base: Destination episode base directory.
+        path: The directory path to create.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def extract_timestamp(filename: str) -> int:
+    """Extracts the nanosecond timestamp from a frame filename.
+
+    Args:
+        filename: Image filename, e.g., 'frame1756826516968031906_left.jpg'.
 
     Returns:
-        True if the episode directory exists and is non-empty.
-    """
-    return dst_base.exists() and any(dst_base.iterdir())
+        The extracted timestamp as an integer.
 
-def find_sessions(post_process_dir: Path) -> Iterator[Tuple[Path, int, str]]:
-    """Yield discovered post_process session directories.
+    Raises:
+        ValueError: If the filename does not contain a timestamp pattern.
+    """
+    match = FRAME_RE.search(filename)
+    if match:
+        return int(match.group(1))
+    raise ValueError(f"Could not extract timestamp from filename: {filename}")
+
+
+def _frame_key(filename: str) -> Union[int, str]:
+    """Returns a sorting key for filenames.
+
+    Prioritizes the numeric frame index or timestamp extracted from the filename.
 
     Args:
-        post_process_dir: Root directory containing post_process entries.
+        filename: The filename to generate a key for.
+
+    Returns:
+        An integer key if a number is found, otherwise the filename string.
+    """
+    match = FRAME_RE.search(filename)
+    if match:
+        return int(match.group(1))
+    return filename
+
+
+def list_sorted_frames(src_dir: Path, suffix: str) -> List[str]:
+    """Lists and sorts filenames in a directory by frame number/timestamp.
+
+    Args:
+        src_dir: The directory to search for files.
+        suffix: The suffix to filter files by (e.g., '_left.jpg').
+
+    Returns:
+        A sorted list of filenames. Returns an empty list if directory is missing.
+    """
+    if not src_dir.is_dir():
+        return []
+    files = [
+        f.name for f in src_dir.iterdir() if f.is_file() and f.name.endswith(suffix)
+    ]
+    files.sort(key=_frame_key)
+    return files
+
+
+def find_sessions(post_process_dir: Path) -> Iterator[Tuple[Path, int, str]]:
+    """Discovers post-process session directories.
+
+    Args:
+        post_process_dir: The root directory containing post-process output.
 
     Yields:
-        Tuples of (post_dir_path, tissue_num, session_name).
+        Tuples containing (directory_path, tissue_number, session_name).
     """
     if not post_process_dir.is_dir():
         return
     for entry in post_process_dir.iterdir():
         if not entry.is_dir():
             continue
-        m = re.match(r"cautery_tissue(\d+)_(.+)_left_video$", entry.name)
-        if not m:
+        # Expected format: cautery_tissue<N>_<session_name>_left_video
+        match = re.match(r"cautery_tissue(\d+)_(.+)_left_video$", entry.name)
+        if not match:
             continue
-        tissue = int(m.group(1))
-        session = m.group(2)
+        tissue = int(match.group(1))
+        session = match.group(2)
         yield entry, tissue, session
 
 
 def read_annotation_jsons(annotation_dir: Path) -> Iterator[Path]:
-    """Yield all JSON annotation files under annotation_dir.
+    """Recursively yields all JSON annotation files in a directory.
 
     Args:
-        annotation_dir: Directory to walk for .json files.
+        annotation_dir: The directory to search for .json files.
 
     Yields:
-        Paths to .json files.
+        Paths to discovered JSON files.
     """
     if not annotation_dir.is_dir():
         return
     for root, _, files in os.walk(annotation_dir):
-        for fn in files:
-            if fn.lower().endswith(".json"):
-                yield Path(root) / fn
+        for filename in files:
+            if filename.lower().endswith(".json"):
+                yield Path(root) / filename
 
 
-def ensure_dir(p: Path) -> None:
-    """Create directory `p` if it does not exist (idempotent)."""
-    p.mkdir(parents=True, exist_ok=True)
+# --- CSV Slicing -------------------------------------------------------------
 
+def slice_ee_csv(
+    src_csv: Path, out_csv: Path, start_idx: int, end_idx: int
+) -> Tuple[int, str]:
+    """Slices a CSV file to include only rows within the specified range.
 
-def extract_timestamp(filename: str) -> int:
-    """Extracts nanosecond timestamp from image filename.
-
-    Args:
-        filename: Image filename like 'frame1756826516968031906_left.jpg'.
-
-    Returns:
-        The extracted timestamp in nanoseconds.
-
-    Raises:
-        ValueError: If the filename does not match the expected pattern.
-    """
-    m = FRAME_RE.search(filename)
-    if m:
-        return int(m.group(1))
-    raise ValueError(f"Could not extract timestamp from filename: {filename}")
-
-
-def _frame_key(fn: str) -> int | str:
-    """Return a sort key for filenames: integer frame number/timestamp when present.
-
-    Using a numeric key ensures correct ordering for both `frame0001` (index) 
-    and `frame178...` (timestamp) naming conventions.
-    """
-    m = FRAME_RE.search(fn)
-    if m:
-        return int(m.group(1))
-    return fn
-
-
-def list_sorted_frames(src_dir: Path, suffix: str) -> List[str]:
-    """List and return sorted filenames in `src_dir` ending with `suffix`.
+    This function attempts to detect a header. If the first cell converts to an
+    integer, it assumes no header exists.
 
     Args:
-        src_dir: Directory containing frame files.
-        suffix: Filename suffix (e.g. '_left.jpg').
+        src_csv: Path to the source CSV file.
+        out_csv: Path to the destination CSV file.
+        start_idx: The starting row index (0-indexed, inclusive).
+        end_idx: The ending row index (0-indexed, inclusive).
 
     Returns:
-        Sorted list of filenames (basename strings). Returns [] if dir missing.
-    """
-    if not src_dir.is_dir():
-        return []
-    files = [f.name for f in src_dir.iterdir() if f.is_file() and f.name.endswith(suffix)]
-    files.sort(key=_frame_key)
-    return files
-
-
-# --- CSV slicing -------------------------------------------------------------
-def slice_ee_csv(src_csv: Path, out_csv: Path, start: int, end: int) -> Tuple[int, str]:
-    """Slice rows from a CSV according to frame indices and write to out_csv.
-
-    The function streams the input CSV to avoid loading large files wholly into memory.
-    It detects presence of a header by attempting to convert the first cell to int.
-
-    Args:
-        src_csv: Source CSV path.
-        out_csv: Destination CSV path to write sliced rows.
-        start: Start index (inclusive) mapped to data row index 0.
-        end: End index (inclusive).
-
-    Returns:
-        Tuple (number_of_rows_written, status_string). Status can be 'ok', 'missing', or 'empty'.
+        A tuple of (rows_written, status). Status is one of 'ok', 'missing',
+        'empty', or 'error'.
     """
     if not src_csv.exists():
         return 0, "missing"
 
-    start_idx = max(0, start)
-    end_idx = max(0, end)
+    start = max(0, start_idx)
+    end = max(0, end_idx)
+    rows_written = 0
 
-    written = 0
     try:
         with src_csv.open("r", newline="") as fin:
             reader = csv.reader(fin)
@@ -175,60 +192,57 @@ def slice_ee_csv(src_csv: Path, out_csv: Path, start: int, end: int) -> Tuple[in
             except StopIteration:
                 return 0, "empty"
 
-            # Determine header presence: if first cell casts to int -> it's data
+            # Check for header
             header = None
             try:
                 int(first_row[0])
-                # first_row is data
-                first_data_row = first_row
-                # We want to continue iteration starting from first_data_row then reader
-                data_iter = (r for r in ([first_data_row] + list(reader)))
-            except Exception:
+                # First row is data
+                data_iter = (r for r in ([first_row] + list(reader)))
+            except (ValueError, IndexError):
+                # First row is likely a header
                 header = first_row
                 data_iter = reader
 
-            # Write only the slice [start_idx, end_idx] inclusive
             ensure_dir(out_csv.parent)
             with out_csv.open("w", newline="") as fout:
                 writer = csv.writer(fout)
                 if header is not None:
                     writer.writerow(header)
 
-                # iterate data rows and only write rows in requested range
-                for idx, row in enumerate(data_iter):
-                    if idx < start_idx:
+                for i, row in enumerate(data_iter):
+                    if i < start:
                         continue
-                    if idx > end_idx:
+                    if i > end:
                         break
                     writer.writerow(row)
-                    written += 1
+                    rows_written += 1
+
     except Exception as e:
-        logger.exception("Failed to slice ee_csv %s -> %s: %s", src_csv, out_csv, e)
-        return written, "error"
-    return written, "ok"
+        logger.exception("Failed to slice CSV %s -> %s: %s", src_csv, out_csv, e)
+        return rows_written, "error"
+
+    return rows_written, "ok"
 
 
-# --- file copying with concurrency & optional hardlinks ---------------------
+# --- File Operations ---------------------------------------------------------
+
 def copy_or_link(
-    src: Path,
-    dst: Path,
-    use_hardlink: bool = False,
-    overwrite: bool = False,
+    src: Path, dst: Path, use_hardlink: bool = False, overwrite: bool = False
 ) -> bool:
-    """Copy or hardlink a single file from src to dst.
+    """Copies or hardlinks a file from source to destination.
 
     Args:
         src: Source file path.
         dst: Destination file path.
-        use_hardlink: Attempt hardlink before copying.
-        overwrite: Whether to overwrite dst if it exists.
+        use_hardlink: If True, attempts to create a hardlink first.
+        overwrite: If True, overwrites the destination if it exists.
 
     Returns:
-        True on success, False otherwise.
+        True if the operation succeeded, False otherwise.
     """
     try:
         if dst.exists() and not overwrite:
-            return True  # treated as success (already present)
+            return True
 
         ensure_dir(dst.parent)
 
@@ -238,8 +252,9 @@ def copy_or_link(
                     dst.unlink()
                 os.link(src, dst)
                 return True
-            except Exception:
-                pass  # fallback to copy
+            except OSError:
+                # Fallback to copy if link fails (e.g., cross-device)
+                pass
 
         if dst.exists() and overwrite:
             dst.unlink()
@@ -248,35 +263,36 @@ def copy_or_link(
         return True
 
     except Exception:
-        logger.debug("Failed to copy %s -> %s", src, dst, exc_info=True)
+        logger.debug("Failed to copy/link %s -> %s", src, dst, exc_info=True)
         return False
 
 
+# --- Core Logic -------------------------------------------------------------
 
-
-
-# --- main orchestration -----------------------------------------------------
 def plan_episodes(
-    post_dir: Path, 
-    cautery_dir: Path, 
+    post_dir: Path,
+    cautery_dir: Path,
     out_dir: Path,
-    source_dataset_dir: Optional[Path] = None
+    source_dataset_dir: Optional[Path] = None,
 ) -> List[Tuple[Path, Path, Path, Path, int, int]]:
-    """Scan annotations and plan episodes to create.
+    """Scans annotations and plans the episodes to create.
 
     Args:
-        post_dir: Root post_process directory.
-        cautery_dir: Root raw cautery directory (used for reference indices).
-        out_dir: Destination root for sliced dataset.
-        source_dataset_dir: Root directory of data to actually copy (if None, use cautery_dir).
+        post_dir: Root directory of post-process annotations.
+        cautery_dir: Root directory of raw cautery data (reference).
+        out_dir: Output directory for the sliced dataset.
+        source_dataset_dir: Root directory of the dataset to slice.
+                            If None, defaults to cautery_dir.
 
     Returns:
-        List of tuples: (annotation_json, ref_session_dir, source_session_dir, dst_base, start, end)
+        A list of planning tuples:
+        (annotation_path, ref_session_dir, src_session_dir, dst_base_dir, start_frame, end_frame)
     """
-    planned = []
-    counters = {}
+    planned_episodes = []
     
-    # If source location not specified, assume we are slicing the raw data itself (legacy mode)
+    # Track episode counts per (tissue, subtask) to generate IDs like episode_001
+    episode_counters: Dict[Tuple[int, str], int] = {}
+
     if source_dataset_dir is None:
         source_dataset_dir = cautery_dir
 
@@ -284,60 +300,84 @@ def plan_episodes(
         annotation_dir = post_path / "annotation"
         if not annotation_dir.is_dir():
             continue
-            
-        # Reference path (RAW data) - used to resolve index N to Timestamp T
+
         ref_session_dir = cautery_dir / f"cautery_tissue#{tissue_num}" / session_name
-        
-        # Source path (TARGET data to slice) - used to find frame closest to Timestamp T
-        # We assume the directory structure is preserved: tissue_N/session_name
+
+        # Resolve source directory
         if source_dataset_dir == cautery_dir:
-             src_session_dir = ref_session_dir
+            src_session_dir = ref_session_dir
         else:
-             # Handle possible structural differences. 
-             # Filtered dataset: tissue_1/session_name
-             # Raw dataset: cautery_tissue#1/session_name
-             # We try a few strict patterns, fallback to flexible matching logic can be added if needed.
-             # Current assumption: Source matches `tissue_{N}/{session}` pattern from conversion scripts.
-             src_session_dir = source_dataset_dir / f"tissue_{tissue_num}" / session_name
-             if not src_session_dir.exists():
-                 # Fallback: maybe source has same names as raw?
-                 src_session_dir = source_dataset_dir / f"cautery_tissue#{tissue_num}" / session_name
+            # Assume converted dataset structure: tissue_N/session_name
+            src_session_dir = (
+                source_dataset_dir / f"tissue_{tissue_num}" / session_name
+            )
+            if not src_session_dir.exists():
+                # Fallback to raw structure
+                src_session_dir = (
+                    source_dataset_dir / f"cautery_tissue#{tissue_num}" / session_name
+                )
 
         if not ref_session_dir.is_dir():
-            logger.warning("Reference session dir not found: %s (skipping)", ref_session_dir)
+            logger.warning(
+                "Reference session dir not found: %s", ref_session_dir
+            )
             continue
-            
         if not src_session_dir.is_dir():
-             logger.warning("Source session dir not found: %s (skipping)", src_session_dir)
-             continue
+            logger.warning("Source session dir not found: %s", src_session_dir)
+            continue
 
         for ann_path in read_annotation_jsons(annotation_dir):
             try:
-                ann = json.loads(ann_path.read_text())
+                content = ann_path.read_text(encoding="utf-8")
+                ann_data = json.loads(content)
             except Exception as e:
-                logger.warning("Failed to read %s: %s", ann_path, e)
+                logger.warning("Failed to read JSON %s: %s", ann_path, e)
                 continue
 
-            ar = ann.get("affordance_range") or ann.get("afforadance_range")
-            if not ar:
-                logger.warning("No affordance_range in %s", ann_path)
+            # Extract range
+            affordance = ann_data.get("affordance_range") or ann_data.get(
+                "afforadance_range"
+            )
+            if not affordance:
+                logger.warning("No affordance_range found in %s", ann_path)
                 continue
+
             try:
-                start = int(ar.get("start"))
-                end = int(ar.get("end"))
-            except Exception:
-                logger.warning("Invalid affordance_range in %s", ann_path)
+                start = int(affordance.get("start"))
+                end = int(affordance.get("end"))
+            except (ValueError, TypeError):
+                logger.warning("Invalid affordance range in %s", ann_path)
                 continue
 
-            key = (tissue_num, session_name)
-            idx = counters.get(key, 0) + 1
-            counters[key] = idx
+            # Extract action and determine subdirectory
+            action = ann_data.get("action", "unknown").lower().strip()
+            
+            # Use mapped name or fallback to action name itself
+            # If not in mapping, we might want to put it in a generic folder or just use the name
+            # For now, we use the name directly if not mapped, potentially prefixed if needed.
+            # But the requirement suggests specific structure for grasp/dissect.
+            subtask_dir_name = ACTION_SUBDIRS.get(action, action)
+            
+            # Counters are keyed by (tissue, subtask) to give sequential IDs per subtask folder
+            counter_key = (tissue_num, subtask_dir_name)
+            idx = episode_counters.get(counter_key, 0) + 1
+            episode_counters[counter_key] = idx
+            
             episode_name = f"episode_{idx:03d}"
-            dst_base = out_dir / f"tissue_{tissue_num}" / session_name / episode_name
             
-            planned.append((ann_path, ref_session_dir, src_session_dir, dst_base, start, end))
-            
-    return planned
+            # Destination: dataset_sliced/tissue_N/<subtask>/episode_XXX
+            dst_base = (
+                out_dir
+                / f"tissue_{tissue_num}"
+                / subtask_dir_name
+                / episode_name
+            )
+
+            planned_episodes.append(
+                (ann_path, ref_session_dir, src_session_dir, dst_base, start, end)
+            )
+
+    return planned_episodes
 
 
 def process_episode(
@@ -350,269 +390,332 @@ def process_episode(
     use_hardlink: bool,
     overwrite: bool,
 ) -> Tuple[int, int, int]:
-    """Process a single episode with index-to-timestamp alignment.
-
-    1. Reads file list from `ref_session_dir` (raw data) to find `start_timestamp` and `end_timestamp`.
-    2. Reads file list from `src_session_dir` (target data).
-    3. Finds indices in target data that correspond to start/end timestamps.
-    4. Copies files and slices CSV based on new target indices.
+    """Processes a single episode: aligns timestamps and copies data.
 
     Args:
-        ref_session_dir: Directory of original raw session (reference).
-        src_session_dir: Directory of data to slice (source).
-        dst_base: Destination base directory for this episode.
-        start_idx: Start frame index in REFERENCE (RAW) coordinate system.
-        end_idx: End frame index in REFERENCE (RAW) coordinate system.
-        workers: Number of parallel file-copy workers.
-        use_hardlink: Whether to attempt hardlinks instead of copying.
-        overwrite: Overwrite existing destination.
+        ref_session_dir: Raw session directory (for timestamp reference).
+        src_session_dir: Target session directory (source of files).
+        dst_base: Destination directory for the episode.
+        start_idx: Start frame index (in reference timeline).
+        end_idx: End frame index (in reference timeline).
+        workers: Number of threads for file copying.
+        use_hardlink: Whether to use hardlinks.
+        overwrite: Whether to overwrite existing files.
 
     Returns:
-        Tuple (copied_count, missing_count, ee_rows_written)
+        A tuple of (files_copied, files_missing, csv_rows_written).
     """
-    # 1. Resolve Timestamps from Reference (Raw) Data
+    # 1. Resolve Timestamps from Reference
     ref_left_dir = ref_session_dir / "left_img_dir"
     ref_files = list_sorted_frames(ref_left_dir, "_left.jpg")
-    
-    # Safety clamp
-    s_idx = max(0, min(start_idx, len(ref_files) - 1))
-    e_idx = max(0, min(end_idx, len(ref_files) - 1))
-    
+
     if not ref_files:
-        logger.error(f"Reference directory empty: {ref_left_dir}")
-        return 0, 0, 0
-        
-    try:
-        t_start = extract_timestamp(ref_files[s_idx])
-        t_end = extract_timestamp(ref_files[e_idx])
-    except ValueError as e:
-        logger.error(f"Failed to extract timestamp from reference files: {e}")
+        logger.error("Reference directory empty: %s", ref_left_dir)
         return 0, 0, 0
 
-    # 2. Map Timestamps to Source (Target/Filtered) Data Indices
+    s_idx_clamped = max(0, min(start_idx, len(ref_files) - 1))
+    e_idx_clamped = max(0, min(end_idx, len(ref_files) - 1))
+
+    try:
+        t_start = extract_timestamp(ref_files[s_idx_clamped])
+        t_end = extract_timestamp(ref_files[e_idx_clamped])
+    except ValueError as e:
+        logger.error("Timestamp extraction failed: %s", e)
+        return 0, 0, 0
+
+    # 2. Map to Source Indices
     src_left_dir = src_session_dir / "left_img_dir"
     src_files = list_sorted_frames(src_left_dir, "_left.jpg")
-    
+
     if not src_files:
-        logger.error(f"Source directory empty: {src_left_dir}")
+        logger.error("Source directory empty: %s", src_left_dir)
         return 0, 0, 0
 
-    # Extract all source timestamps efficiently
-    # Optimization: If filenames are standard 'frame<Timestamp>...', this is fast
     try:
         src_timestamps = np.array([extract_timestamp(f) for f in src_files])
     except ValueError:
-        logger.error(f"Source files in {src_left_dir} have invalid timestamp format")
+        logger.error("Invalid timestamp format in source: %s", src_left_dir)
         return 0, 0, 0
 
-    # Use binary search to find the closest insertion points
+    # Find closest frames in source corresponding to reference timestamps
     new_start_idx = int(np.searchsorted(src_timestamps, t_start, side="left"))
     new_end_idx = int(np.searchsorted(src_timestamps, t_end, side="right")) - 1
 
-    # Clamp to valid range
     new_start_idx = max(0, min(new_start_idx, len(src_files) - 1))
     new_end_idx = max(0, min(new_end_idx, len(src_files) - 1))
-    
-    # Validation: Ensure we picked frames reasonably close in time?
-    # For now, we trust the nearest match logic (searchsorted).
 
-    # 3. Setup Paths for Copying
-    left_src = src_session_dir / "left_img_dir"
-    right_src = src_session_dir / "right_img_dir"
-    psm1_src = src_session_dir / "endo_psm1"
-    psm2_src = src_session_dir / "endo_psm2"
+    # 3. Setup File Lists
+    right_src_dir = src_session_dir / "right_img_dir"
+    psm1_src_dir = src_session_dir / "endo_psm1"
+    psm2_src_dir = src_session_dir / "endo_psm2"
     ee_csv_src = src_session_dir / "ee_csv.csv"
 
-    left_dst = dst_base / "left_img_dir"
-    right_dst = dst_base / "right_img_dir"
-    psm1_dst = dst_base / "endo_psm1"
-    psm2_dst = dst_base / "endo_psm2"
-    ee_out = dst_base / "ee_csv.csv"
+    # Destination paths
+    dst_dirs = {
+        "left": dst_base / "left_img_dir",
+        "right": dst_base / "right_img_dir",
+        "psm1": dst_base / "endo_psm1",
+        "psm2": dst_base / "endo_psm2",
+    }
+    ee_csv_dst = dst_base / "ee_csv.csv"
 
-    # 4. Prepare File Lists based on NEW indices
-    # Optimization: We already have src_files (left), just need to list others if they exist
-    right_files = list_sorted_frames(right_src, "_right.jpg")
-    psm1_files = list_sorted_frames(psm1_src, "_psm1.jpg")
-    psm2_files = list_sorted_frames(psm2_src, "_psm2.jpg")
+    # Get file lists
+    file_lists = {
+        "left": src_files,
+        "right": list_sorted_frames(right_src_dir, "_right.jpg"),
+        "psm1": list_sorted_frames(psm1_src_dir, "_psm1.jpg"),
+        "psm2": list_sorted_frames(psm2_src_dir, "_psm2.jpg"),
+    }
+    
+    src_dirs = {
+        "left": src_left_dir,
+        "right": right_src_dir,
+        "psm1": psm1_src_dir,
+        "psm2": psm2_src_dir,
+    }
 
     indices = range(new_start_idx, new_end_idx + 1)
-    
-    # Safe list getter helper
-    def get_slice(files: List[str], idxs: range) -> List[str]:
-         return [files[i] for i in idxs if 0 <= i < len(files)]
 
-    left_to_copy = get_slice(src_files, indices)
-    right_to_copy = get_slice(right_files, indices)
-    psm1_to_copy = get_slice(psm1_files, indices)
-    psm2_to_copy = get_slice(psm2_files, indices)
-
-    # 5. Execute Copy (Unified ThreadPool for entire episode)
-    # Collect all copy tasks first
-    all_copy_tasks: List[Tuple[Path, Path]] = []
+    # 4. Execute Copy
+    copy_tasks = []
     
-    for s_dir, d_dir, names in (
-        (left_src, left_dst, left_to_copy),
-        (right_src, right_dst, right_to_copy),
-        (psm1_src, psm1_dst, psm1_to_copy),
-        (psm2_src, psm2_dst, psm2_to_copy),
-    ):
-        if not names:
+    for key, file_list in file_lists.items():
+        if not file_list:
             continue
-        ensure_dir(d_dir)
-        for name in names:
-            all_copy_tasks.append((s_dir / name, d_dir / name))
+            
+        target_dir = dst_dirs[key]
+        source_dir = src_dirs[key]
+        ensure_dir(target_dir)
 
-    copied = 0
-    missing = 0
-    
-    # Use one pool for all files in the episode
-    if all_copy_tasks:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            future_to_pair = {
-                ex.submit(copy_or_link, src, dst, use_hardlink, overwrite): (src, dst) 
-                for src, dst in all_copy_tasks
+        for i in indices:
+            if i < len(file_list):
+                fname = file_list[i]
+                copy_tasks.append((source_dir / fname, target_dir / fname))
+
+    copied_count = 0
+    missing_count = 0
+
+    if copy_tasks:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_task = {
+                executor.submit(
+                    copy_or_link, src, dst, use_hardlink, overwrite
+                ): (src, dst)
+                for src, dst in copy_tasks
             }
-            for fut in as_completed(future_to_pair):
-                src, dst = future_to_pair[fut]
+            
+            for future in as_completed(future_to_task):
                 try:
-                    ok = fut.result()
-                except Exception:
-                    ok = False
-                if ok:
-                    copied += 1
-                else:
-                    if not src.exists():
-                        missing += 1
-                        logger.debug("Missing source file: %s", src)
+                    success = future.result()
+                    if success:
+                        copied_count += 1
                     else:
-                        missing += 1
-                        logger.warning("Failed to copy file despite existing: %s", src)
+                        missing_count += 1
+                except Exception:
+                    missing_count += 1
 
-    # 6. Slice CSV using NEW indices
+    # 5. Slice CSV
     ee_rows = 0
-    status = "skipped"
-
-    if not ee_out.exists() or overwrite:
-        ee_rows, status = slice_ee_csv(ee_csv_src, ee_out, new_start_idx, new_end_idx)
+    if not ee_csv_dst.exists() or overwrite:
+        ee_rows, status = slice_ee_csv(
+            ee_csv_src, ee_csv_dst, new_start_idx, new_end_idx
+        )
 
     logger.debug(
-        "Created %s: [%d..%d]->[%d..%d] (frames=%d, ee=%d) copied=%d %s",
-        dst_base.name,
-        start_idx, end_idx, new_start_idx, new_end_idx,
-        len(left_to_copy), ee_rows, copied, status
+        "Episode %s: Copied %d files, %d missing, %d CSV rows.",
+        dst_base.name, copied_count, missing_count, ee_rows
     )
 
-    return copied, missing, ee_rows
+    return copied_count, missing_count, ee_rows
 
 
 def main() -> None:
-    """Parse CLI args and orchestrate episode planning + execution."""
-    p = argparse.ArgumentParser()
-    p.add_argument("--post_process_dir", default="post_process", help="post_process root dir")
-    p.add_argument("--cautery_dir", default="cautery", help="original cautery dir (reference indices)")
-    p.add_argument("--source_dataset_dir", default=None, help="actual dataset to copy/slice (default: same as cautery_dir)")
-    p.add_argument("--out_dir", default="dataset_sliced", help="output dataset root")
-    p.add_argument("--dry_run", action="store_true", help="only list planned operations")
-    p.add_argument("--execute", dest="dry_run", action="store_false")
-    p.add_argument("--workers", type=int, default=8, help="number of parallel copy workers (per-dir)")
-    p.add_argument(
-        "--hardlink",
-        action="store_true",
-        help="attempt to create hardlinks instead of copying when possible (fast, no extra space)",
+    """Main entry point for command-line execution."""
+    parser = argparse.ArgumentParser(
+        description="Slice dataset into action-based episodes."
     )
-    p.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing episode outputs.",
+    parser.add_argument(
+        "--post_process_dir",
+        default="post_process",
+        help="Root directory for post-process annotations (default: post_process)",
     )
-    p.add_argument(
+    parser.add_argument(
+        "--cautery_dir",
+        default="cautery",
+        help="Reference raw directory for timestamp retrieval (default: cautery)",
+    )
+    parser.add_argument(
+        "--source_dataset_dir",
+        default=None,
+        help="Source dataset to slice (defaults to cautery_dir if not matched)",
+    )
+    parser.add_argument(
+        "--out_dir",
+        default="dataset_sliced",
+        help="Output directory for sliced episodes (default: dataset_sliced)",
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Perform a dry run (list plans without executing)",
+    )
+    parser.add_argument(
+        "--execute",
+        dest="dry_run",
+        action="store_false",
+        help="Execute the plan (opposite of --dry_run)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of file copy threads per episode (default: 8)",
+    )
+    parser.add_argument(
         "--episode-workers",
         type=int,
         default=None,
-        help="number of parallel episode workers (default: min(4, cpu_count))",
+        help="Number of parallel episodes (default: auto)",
     )
-    args = p.parse_args()
+    parser.add_argument(
+        "--hardlink",
+        action="store_true",
+        help="Use hardlinks instead of copying where possible",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output files",
+    )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Automatically normalize frame names after slicing (calls normalize_frame_names.py)",
+    )
+
+    args = parser.parse_args()
 
     post_dir = Path(args.post_process_dir)
     cautery_dir = Path(args.cautery_dir)
     source_dir = Path(args.source_dataset_dir) if args.source_dataset_dir else None
     out_dir = Path(args.out_dir)
 
-    planned = plan_episodes(post_dir, cautery_dir, out_dir, source_dataset_dir=source_dir)
-    logger.info("Planned %d episodes to create under: %s", len(planned), out_dir)
+    planned = plan_episodes(
+        post_dir, cautery_dir, out_dir, source_dataset_dir=source_dir
+    )
+
+    logger.info("Planned %d episodes.", len(planned))
 
     if args.dry_run:
-        for ann_path, ref_dir, src_dir, dst_base, start, end in planned:
-            logger.info("PLAN: %s\n  Ref: %s\n  Src: %s\n  Out: %s\n  Raw Frames: %d..%d",
-                        ann_path.name, ref_dir.name, src_dir.name, dst_base.name, start, end)
+        for item in planned:
+            ann, ref, src, dst, s, e = item
+            print(f"PLAN: {dst}\n  Ref: {ref}\n  Src: {src}\n  Range: {s}-{e}")
         return
 
-    # Execute episodes in parallel
-    print(f"Processing {len(planned)} episodes...")
-    
-    # Use ProcessPoolExecutor for episode-level parallelism
-    # We use a default of 4 episode workers if not specified, to avoid memory explosion
-    episode_workers = args.episode_workers if args.episode_workers else min(4, os.cpu_count() or 4)
+    # Execution
+    episode_workers = (
+        args.episode_workers if args.episode_workers else min(4, os.cpu_count() or 4)
+    )
+    # Distribute workers: mostly rely on threads since IO bound, but process per episode
+    # helps with the CPU heavy searchsorted/csv parts if many.
     inner_workers = max(1, args.workers // episode_workers)
-    
-    logger.info(f"Pool: {episode_workers} workers, {inner_workers} threads/worker.")
 
-    completed_count = 0
+    logger.info(
+        "Executing with %d episode workers, %d threads/episode",
+        episode_workers,
+        inner_workers,
+    )
+
     total_copied = 0
-    total_missing = 0 # Track globally for summary
-    
+    total_missing = 0
+
     with ProcessPoolExecutor(max_workers=episode_workers) as executor:
         futures = {}
-        for ann_path, ref_dir, src_dir, dst_base, start, end in planned:
-            if dst_base.exists() and not args.overwrite:
+        for item in planned:
+            ann, ref, src, dst, s, e = item
+            
+            if dst.exists() and not args.overwrite:
                 continue
-                
-            # Heuristic for hardlink in main process
-            use_hardlink_arg = False
-            if args.hardlink:
-                try:
-                    # Check against the ACTUAL source, not the reference
-                    use_hardlink_arg = src_dir.exists() and (src_dir.stat().st_dev == out_dir.stat().st_dev)
-                except Exception:
-                    pass
 
-            fut = executor.submit(
+            # Heuristic check for hardlink feasibility on source drive
+            use_hardlink = args.hardlink
+            
+            future = executor.submit(
                 process_episode,
-                ref_dir,
-                src_dir,
-                dst_base,
-                start,
-                end,
+                ref,
+                src,
+                dst,
+                s,
+                e,
                 inner_workers,
-                use_hardlink_arg,
+                use_hardlink,
                 args.overwrite,
             )
-            futures[fut] = dst_base
+            futures[future] = dst
 
-        # Create progress bar
-        with tqdm(total=len(futures), desc="Processing episodes", unit="episode") as pbar:
-            for fut in as_completed(futures):
-                dst = futures[fut]
-                completed_count += 1
+        with tqdm(total=len(futures), desc="Processing") as pbar:
+            for future in as_completed(futures):
+                dst_path = futures[future]
                 try:
-                    c, m, er = fut.result()
+                    c, m, _ = future.result()
                     total_copied += c
                     total_missing += m
-                    pbar.set_postfix({
-                        'copied': total_copied,
-                        'missing': total_missing
-                    })
                 except Exception as e:
-                    logger.error(f"Failed to process episode {dst}: {e}")
-                    pbar.set_postfix({
-                        'copied': total_copied,
-                        'missing': total_missing,
-                        'error': str(dst.name)
-                    })
-                finally:
-                    pbar.update(1)
+                    logger.error("Episode %s failed: %s", dst_path.name, e)
+                
+                pbar.update(1)
+                pbar.set_postfix({"copied": total_copied})
 
-    logger.info("Done. Total copied files: %d, Total missing: %d", total_copied, total_missing)
+    logger.info("Complete. Total copied: %d, Total missing: %d", total_copied, total_missing)
+
+    # Post-processing: Normalize frame names if requested
+    if args.normalize:
+        logger.info("Starting frame name normalization...")
+        
+        # Locate normalize_frame_names.py relative to this script
+        script_dir = Path(__file__).parent
+        normalize_script = script_dir / "normalize_frame_names.py"
+        
+        if not normalize_script.exists():
+            logger.error(
+                "normalize_frame_names.py not found at %s. Skipping normalization.",
+                normalize_script
+            )
+        else:
+            try:
+                # Build command with appropriate arguments
+                normalize_cmd = [
+                    sys.executable,
+                    str(normalize_script),
+                    "--data-path", str(out_dir),
+                    "--workers", str(args.workers),
+                ]
+                
+                logger.info("Running: %s", " ".join(normalize_cmd))
+                
+                # Run normalization script as subprocess
+                result = subprocess.run(
+                    normalize_cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                
+                # Log output
+                if result.stdout:
+                    for line in result.stdout.strip().split("\n"):
+                        logger.info("[normalize] %s", line)
+                
+                logger.info("Frame normalization completed successfully.")
+                
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    "Frame normalization failed with exit code %d: %s",
+                    e.returncode,
+                    e.stderr,
+                )
+            except Exception as e:
+                logger.error("Unexpected error during normalization: %s", e)
 
 
 if __name__ == "__main__":
