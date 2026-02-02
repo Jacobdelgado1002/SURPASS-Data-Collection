@@ -225,7 +225,7 @@ The typical data processing pipeline flow:
 ```
 Raw Data Collection
         ↓
-[sync_image_kinematics.py]    ← Analyze synchronization quality
+[frames_to_vids.py]           ← Generate videos for annotation
         ↓
 [filter_episodes.py]           ← Filter & synchronize all cameras
         ↓
@@ -238,8 +238,6 @@ Sliced Dataset
 [reformat_data.py]             ← Normalize timestamps & frame names
         ↓
 Training-Ready Dataset
-        ↓
-[frames_to_vids.py]            ← Optional: Generate videos
 ```
 
 ---
