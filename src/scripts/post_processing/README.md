@@ -194,8 +194,8 @@ python slice_affordance.py --hardlink
 # Parallel processing with 8 episode workers, 16 copy workers
 python slice_affordance.py --episode-workers 8 --workers 16
 
-# Automatically normalize frame names after slicing
-python slice_affordance.py --normalize
+# Automatically reformat frame names after slicing
+python slice_affordance.py --reformat
 ```
 
 **Expected Data Structure**:
@@ -300,7 +300,7 @@ ACTION_SUBDIRS = {
 | `--episode-workers` | int | 4 | Parallel episodes to process |
 | `--workers` | int | 8 | File copy workers per episode |
 | `--hardlink` | flag | False | Use hardlinks instead of copying |
-| `--normalize` | flag | False | Run reformat_data.py after slicing |
+| `--reformat` | flag | False | Run reformat_data.py after slicing |
 | `--dry_run` | flag | False | Preview planned episodes |
 
 **CSV Slicing**:
@@ -323,8 +323,8 @@ ACTION_SUBDIRS = {
 python sync_image_kinematics/filter_episodes.py /raw /filtered
 python slice_affordance.py --source_dataset_dir filtered --hardlink
 
-# Slice and immediately normalize
-python slice_affordance.py --normalize
+# Slice and immediately reformat
+python slice_affordance.py --reformat
 
 # High-performance slicing
 python slice_affordance.py --episode-workers 12 --workers 24 --hardlink
@@ -354,7 +354,7 @@ python reformat_data.py \
     --workers 8
 
 # Alternative: Combine steps 2 and 3
-python slice_affordance.py --source_dataset_dir filtered_data --normalize
+python slice_affordance.py --source_dataset_dir filtered_data --reformat
 ```
 
 ---

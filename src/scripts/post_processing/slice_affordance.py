@@ -85,8 +85,8 @@ Usage:
     # Parallel processing with 8 workers
     python3 slice_affordance.py --episode-workers 8 --workers 16
 
-    # Automatically normalize frame names after slicing
-    python3 slice_affordance.py --normalize
+    # Automatically reformat frames
+    python3 slice_affordance.py --reformat
 
 Notes:
     - Timestamp-based alignment ensures consistency across dataset versions
@@ -935,7 +935,7 @@ def main() -> int:
         --episode-workers: Number of parallel episodes
         --hardlink: Use hardlinks instead of copying
         --overwrite: Overwrite existing output files
-        --normalize: Run frame normalization after slicing
+        --reformat: Run frame normalization after slicing
 
     Exit Codes:
         0: Success (all processing completed)
@@ -955,7 +955,7 @@ def main() -> int:
         $ python3 slice_affordance.py --dry_run
 
         # With normalization
-        $ python3 slice_affordance.py --normalize
+        $ python3 slice_affordance.py --reformat
 
     Processing Flow:
         1. Parse command-line arguments
@@ -980,7 +980,7 @@ def main() -> int:
     %(prog)s --source_dataset_dir filtered_data --out_dir episodes
     %(prog)s --dry_run
     %(prog)s --hardlink --episode-workers 8 --workers 16
-    %(prog)s --normalize
+    %(prog)s --reformat
 
     This script uses timestamp-based alignment to slice surgical robot data
     into semantically meaningful action episodes.
