@@ -70,6 +70,7 @@ from typing import Iterable, List, Optional, Tuple
 from logger_config import get_logger
 
 
+
 # ---------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------
@@ -318,6 +319,39 @@ def normalize_episode_frames(episode_path: Path, sort_by: str = "name") -> int:
 # ---------------------------------------------------------------------
 # Per-episode worker
 # ---------------------------------------------------------------------
+
+def process_episode(
+    episode_path: Path,
+    normalize_timestamps: bool,
+    normalize_frames: bool,
+    sort_by: str,
+) -> Tuple[int, int]:
+    """
+    Process a single episode: normalize timestamps and/or rename frames.
+    
+    This function is designed to be called by ProcessPoolExecutor for
+    parallel processing of multiple episodes.
+    
+    Args:
+        episode_path: Path to the episode directory.
+        normalize_timestamps: If True, normalize timestamps in ee_csv.csv.
+        normalize_frames: If True, rename image frames sequentially.
+        sort_by: Sorting method for frames ('name' or 'mtime').
+    
+    Returns:
+        Tuple of (rows_normalized, images_renamed).
+    """
+    rows: int = 0
+    images: int = 0
+    
+    if normalize_timestamps:
+        rows = normalize_episode_timestamps(episode_path)
+    
+    if normalize_frames:
+        images = normalize_episode_frames(episode_path, sort_by=sort_by)
+    
+    return rows, images
+
 
 def run_reformat_data(
     *,
