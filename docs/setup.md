@@ -1,4 +1,4 @@
-# Open-H Data Collection Pipeline
+# SURPASS Data Collection Pipeline
 
 A ROS-based data collection system for the da Vinci Research Kit (dVRK).
 
@@ -28,6 +28,7 @@ Complete these steps before starting the dVRK system:
 #### 1. Hardware Connection
 - Connect all dVRK hardware components to the robot system
 - Verify power connections and communication cables (cameras, tools, etc.)
+- Make sure wrist cameras have a 1 inch distance from tip and are aligned correctly
 
 #### 2. Camera Calibration (One-time setup)
 Perform intrinsic camera calibration once per camera installation:
@@ -74,10 +75,8 @@ roscore
 After completing the IRL setup, launch the main dVRK system in computer #2:
 ```bash
 cd catkin_ws_dvrk/src/dvrk/dvrk_config_jhu/jhu-daVinci-Si
-rosrun dvrk_robot dvrk_system \
-  -j system-SUJ-ECM-MTML-PSM2-MTMR-PSM1-PSM3-Teleop-custom.json \
-  -p 0.001 \
-  -K
+rosrun dvrk_robot dvrk_console_json \
+  -j console-SUJ-ECM-MTML-PSM2-MTMR-PSM1-PSM3-Teleop.json
 ```
 
 **Parameters:**
@@ -91,7 +90,6 @@ rosrun dvrk_robot dvrk_system \
 
 In a new terminal:
 ```bash
-cd ~/Desktop
 roscore
 ```
 
@@ -99,10 +97,15 @@ roscore
 
 In a new terminal:
 ```bash
-roslaunch dvrk_video v4l_stereo_goovis.launch stereo_rig_name:=dvrk_csr
+roslaunch dvrk_video stereo_decklink_goovis.launch stereo_rig_name:=jhu_daVinci images_per_seconds:=30
 ```
 
-### 3. Launch PSM1 Endoscope Camera
+### 3. View PSM wrist cameras
+```bash
+rosrun rqt_image_view rqt_image_view
+```
+
+<!-- ### 3. Launch PSM1 Endoscope Camera
 
 In a new terminal:
 ```bash
@@ -124,14 +127,14 @@ roslaunch dvrk_video gscam_v4l.launch \
   images_per_second:=30
 ```
 
-**Note:** Replace `[Y]` with the actual video device number (e.g., `/dev/video2`)
+**Note:** Replace `[Y]` with the actual video device number (e.g., `/dev/video2`) -->
 
 ## Running Data Collection
 
 Once all components are launched, start the data collection:
 ```bash
 cd ~/catkin_ws_dvrk/src
-roslaunch rqt_mypkg record_op_pedals.launch
+roslaunch rqt_mypkg record_op_pedals_toggle.launch
 ```
 
 This will begin recording operational data and pedal inputs.
@@ -166,4 +169,4 @@ rqt_image_view
 ---
 
 **Maintainer:** [Jacob M. Delgado López]  
-**Last Updated:** [11/5/2025]
+**Last Updated:** [02/9/2026]
