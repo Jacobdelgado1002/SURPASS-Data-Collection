@@ -75,7 +75,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from logger_config import get_logger
+from surpass_data_collection.logger_config import get_logger
 
 # ---------------------------------------------------------------------
 # Module constants

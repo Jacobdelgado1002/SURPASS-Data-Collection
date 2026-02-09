@@ -87,6 +87,7 @@ import bisect
 import os
 import shutil
 import sys
+import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -94,7 +95,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 from tqdm import tqdm
 
-from logger_config import get_logger
+from surpass_data_collection.logger_config import get_logger
 
 # Import synchronization module
 # Handle multiple possible import locations
