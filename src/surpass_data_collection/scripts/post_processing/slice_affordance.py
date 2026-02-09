@@ -112,8 +112,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 from tqdm import tqdm
 
-from logger_config import get_logger
-from reformat_data import run_reformat_data
+from surpass_data_collection.logger_config import get_logger
+from surpass_data_collection.scripts.post_processing.reformat_data import run_reformat_data
 
 
 # ---------------------------------------------------------------------

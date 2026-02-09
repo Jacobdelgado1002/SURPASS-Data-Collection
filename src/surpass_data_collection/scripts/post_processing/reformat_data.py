@@ -67,8 +67,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from logger_config import get_logger
-
+from surpass_data_collection.logger_config import get_logger
 
 
 # ---------------------------------------------------------------------
@@ -351,7 +350,6 @@ def process_episode(
         images = normalize_episode_frames(episode_path, sort_by=sort_by)
     
     return rows, images
-
 
 def run_reformat_data(
     *,

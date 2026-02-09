@@ -98,30 +98,37 @@ Utilities for converting image frame sequences into video files for visualizatio
 Install required dependencies:
 
 ```bash
-pip install opencv-python numpy matplotlib pandas
+pip install opencv-python numpy matplotlib pandas tqdm
+```
+
+Pip install this package. From the repository base directory, run:
+```bash
+pip install -e .
 ```
 
 ### Typical Workflow
 
+**NOTE: The below assumed that your original data is in the `../Data` directory...**
+
 #### 1. **Synchronize Images and Kinematics** (First Step)
 ```bash
 # Analyze single episode
-python src/scripts/sync_image_kinematics/sync_image_kinematics.py /path/to/episode --camera left
+# python src/scripts/sync_image_kinematics/sync_image_kinematics.py /path/to/episode --camera left
 
 # Filter entire dataset
-python src/scripts/sync_image_kinematics/filter_episodes.py /raw/data /filtered/data
+python -m surpass_data_collection.scripts.sync_image_kinematics.filter_episodes.py ../Data ../Filtered_Data
 ```
 
 #### 2. **Slice Into Actions** (After synchronization)
 ```bash
 # Slice based on annotations
-python src/scripts/post_processing/slice_affordance.py
+python -m surpass_data_collection.scripts.post_processing.slice_affordance --post_process_dir ../Data/Cholecystectomy/post_annotation/ --cautery_dir ../Filtered_Data/Cholecystectomy/tissues --out_dir ../Filtered_Data/Cholecystectomy/tissues_sliced
 ```
 
 #### 3. **Reformat for Training** (After slicing)
 ```bash
 # Normalize timestamps and rename frames
-python src/scripts/post_processing/reformat_data.py --data-path dataset_sliced
+python -m surpass_data_collection.scripts.post_processing.reformat_data --data-path ../Filtered_Data/Cholecystectomy/tissues_sliced
 ```
 
 #### 4. **Generate Videos** (Optional - for visualization)
