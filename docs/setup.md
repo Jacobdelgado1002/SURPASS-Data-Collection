@@ -49,6 +49,7 @@ rosrun dvrk_camera_registration stereo_calib_GStream.py
 Perform hand-eye calibration every time the system restarts to establish the spatial relationship between the camera and robot manipulator.
 
 **Run the registration script:**
+Put the Aruco tag on the wrists and move it around for a bit in order to collect data.
 ```bash
 rosrun dvrk_camera_registration camera_registration.py
 ```
@@ -58,9 +59,9 @@ rosrun dvrk_camera_registration camera_registration.py
 After calibration, visualize the gripper pose to verify accuracy:
 ```bash
 rosrun dvrk_camera_registration vis_gripper_pose.py \
-  -p PSM2 \
-  -c /dvrk_csr/left \
-  -H PSM2-registration-open-cv.json
+  -p [X] \
+  -c /dvrk_csr/[X]t \
+  -H [X]-registration-open-cv.json
 ```
 
 **Parameters:**
