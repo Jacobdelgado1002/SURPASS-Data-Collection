@@ -32,11 +32,18 @@ Complete these steps before starting the dVRK system:
 
 #### 2. Camera Calibration (One-time setup)
 Perform intrinsic camera calibration once per camera installation:
+
+This will start a script that will capture images every time you press ENTER. You must take the checkerboard and move it around to capture images of the board at different positions and angles. (33 captured images)
 ```bash
-rosrun dvrk_camera_registration camera_calibration.py
+rosrun dvrk_camera_registration save_sync_images_gstream.py
 ```
 
-**Note:** This only needs to be done once unless cameras are physically moved or replaced.
+This will take the saved images and perform stereo calibration.
+```bash
+rosrun dvrk_camera_registration stereo_calib_GStream.py
+```
+
+**Note:** This calibration only needs to be done once, unless the endoscope camera is replaced.
 
 #### 3. Hand-Eye Calibration (Required at each startup)
 Perform hand-eye calibration every time the system restarts to establish the spatial relationship between the camera and robot manipulator.
