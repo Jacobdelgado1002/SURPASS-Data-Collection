@@ -316,7 +316,7 @@ def convert_data_to_lerobot(
         },
         image_writer_processes=16,
         image_writer_threads=20,
-        tolerance_s=0.3,
+        tolerance_s=0.1,
         batch_encoding_size=150,
     )
     

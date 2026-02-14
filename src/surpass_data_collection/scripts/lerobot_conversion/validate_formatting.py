@@ -668,7 +668,6 @@ class OpenHDatasetValidator:
                 repo_id="jacobdelgado1002/Cholecystectomy",
                 root=str(self.dataset_path),
                 video_backend="pytorch",
-                tolerance_s=0.3,
             )
 
             self.add_result(
