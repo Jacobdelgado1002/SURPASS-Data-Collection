@@ -10,10 +10,11 @@ This script combines two normalization steps into a single, maintainable pipelin
        
 2. Timestamp normalization
    Converts absolute nanosecond timestamps in `ee_csv.csv` to relative seconds
-   starting at 0.0 for each episode.
+   starting at 0.0 for each episode. Makes sure the timestamps are spaced at 1/fps seconds, which ensures
+   compatibility with LeRobot datasets.
 
    Formula:
-       (current_timestamp_ns - first_timestamp_ns) / 1e9
+       current_timestamp_idx * 1 / fps
 
 2. Frame renaming
    Renames images in camera subdirectories to a consistent sequential format:
