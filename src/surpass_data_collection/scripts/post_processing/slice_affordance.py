@@ -1207,10 +1207,6 @@ def main() -> int:
         run_reformat_data(
             base_dir=out_dir,
             workers=args.workers,
-            episode_workers=args.episode_workers,
-            dry_run=args.dry_run,
-            execute=args.execute,
-            overwrite=args.overwrite,
         )
 
     return 0
