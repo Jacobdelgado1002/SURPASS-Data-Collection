@@ -215,8 +215,8 @@ def process_episode(
                 np.float32
             ),
             "instruction.text": subtask_prompt,
-            "observation.meta.tool.psm1": "Large Needle Driver",
-            "observation.meta.tool.psm2": "Debakey Forceps",
+            "observation.meta.tool.psm1": "Permanent Cautery Hook",
+            "observation.meta.tool.psm2": "Prograsp Forceps",
         }
 
         for cam_name, images in [
