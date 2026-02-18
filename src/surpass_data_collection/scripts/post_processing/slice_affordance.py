@@ -85,9 +85,6 @@ Usage:
     # Parallel processing with 8 workers
     python3 slice_affordance.py --episode-workers 8 --workers 16
 
-    # Automatically reformat frames
-    python3 slice_affordance.py --reformat
-
 Notes:
     - Timestamp-based alignment ensures consistency across dataset versions
     - Reference dataset provides ground truth timestamps
@@ -935,7 +932,6 @@ def main() -> int:
         --episode-workers: Number of parallel episodes
         --hardlink: Use hardlinks instead of copying
         --overwrite: Overwrite existing output files
-        --reformat: Run frame normalization after slicing
 
     Exit Codes:
         0: Success (all processing completed)
@@ -953,9 +949,6 @@ def main() -> int:
 
         # Dry run to preview
         $ python3 slice_affordance.py --dry_run
-
-        # With normalization
-        $ python3 slice_affordance.py --reformat
 
     Processing Flow:
         1. Parse command-line arguments
@@ -980,7 +973,6 @@ def main() -> int:
     %(prog)s --source_dataset_dir filtered_data --out_dir episodes
     %(prog)s --dry_run
     %(prog)s --hardlink --episode-workers 8 --workers 16
-    %(prog)s --reformat
 
     This script uses timestamp-based alignment to slice surgical robot data
     into semantically meaningful action episodes.
@@ -1048,12 +1040,6 @@ def main() -> int:
         "--overwrite",
         action="store_true",
         help="Overwrite existing output files",
-    )
-
-    parser.add_argument(
-        "--reformat",
-        action="store_true",
-        help="Run reformat_data.py after slicing",
     )
 
     args = parser.parse_args()
@@ -1200,14 +1186,13 @@ def main() -> int:
     logger.info(f"Total CSV rows: {total_csv_rows}")
     logger.info("=" * 70)
 
-    # Post-processing: Normalize frame names if requested
-    if args.reformat:
-        logger.info("Starting reformat_data.py...")
+    # Post-processing: Normalize frame names
+    logger.info("Starting reformat_data.py...")
 
-        run_reformat_data(
-            base_dir=out_dir,
-            workers=args.workers,
-        )
+    run_reformat_data(
+        base_dir=out_dir,
+        workers=args.workers,
+    )
 
     return 0
 
