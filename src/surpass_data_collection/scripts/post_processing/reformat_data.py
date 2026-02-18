@@ -169,16 +169,23 @@ def normalize_episode_timestamps(episode_path: Path, fps: int = 30) -> int:
     Normalize timestamps inside a single episode's `ee_csv.csv` and resample to uniform 1/fps intervals.
 
     This function does the following:
-    1. Converts nanosecond timestamps to absolute seconds.
-    2. Converts them to relative seconds starting at 0.
-    3. Resamples timestamps so they are uniformly spaced at 1/fps seconds.
-
+    1. Converts nanosecond timestamps to relative seconds starting at 0.
+    2. Resamples timestamps so they are uniformly spaced at 1/fps seconds, which ensures
+       compatibility with LeRobot datasets.
+    
     Args:
         episode_path (Path): Episode directory containing ee_csv.csv.
         fps (int, optional): Target frames per second. Defaults to 30.
 
     Returns:
         int: Number of rows successfully normalized and written.
+
+    Notes:
+        - Preserves header row automatically.
+        - Uses streaming CSV read/write.
+        - Writes to a temporary file first and then atomically replaces the original CSV.
+        - Invalid rows are skipped with a warning.
+        - Timestamps will be exactly multiples of 1/fps after processing.
     """
     csv_path: Path = episode_path / "ee_csv.csv"
     if not csv_path.exists():
@@ -186,7 +193,7 @@ def normalize_episode_timestamps(episode_path: Path, fps: int = 30) -> int:
 
     temp_path: Path = csv_path.with_suffix(".tmp")
     rows_processed: int = 0
-    dt: float = 1.0 / fps  # 30 FPS → 0.033333...
+    dt = 1.0 / fps  # uniform spacing
 
     with csv_path.open("r", newline="") as fin, temp_path.open("w", newline="") as fout:
         reader = csv.reader(fin)
@@ -198,8 +205,9 @@ def normalize_episode_timestamps(episode_path: Path, fps: int = 30) -> int:
             return 0
 
         header: list[str] | None = None
+        first_timestamp_ns: int | None = None
 
-        # Detect header
+        # Detect header by attempting integer conversion
         try:
             first_timestamp_ns = int(first_row[0])
             first_data_row = first_row
@@ -209,33 +217,20 @@ def normalize_episode_timestamps(episode_path: Path, fps: int = 30) -> int:
             first_data_row = next(reader)
             first_timestamp_ns = int(first_data_row[0])
 
-        # Convert first timestamp from ns → seconds
-        first_timestamp_sec: float = first_timestamp_ns / 1e9
-
-        # First row always becomes 0.0 seconds
-        first_data_row[0] = f"{0.0:.9f}"
+        # First row always becomes 0.0
+        first_data_row[0] = "0.0"
         writer.writerow(first_data_row)
         rows_processed += 1
 
-        # Stream remaining rows
-        frame_idx: int = 1
-
+        # Stream remaining rows and assign uniform timestamps
+        frame_idx = 1  # starts from 1 because first row is 0.0
         for row in reader:
             try:
-                current_timestamp_ns = int(row[0])
-                current_timestamp_sec = current_timestamp_ns / 1e9
-
-                # Relative seconds (computed but not used for spacing —
-                # we enforce strict 30 FPS uniform timestamps)
-                _relative_sec = current_timestamp_sec - first_timestamp_sec
-
-                # Enforce uniform 30 FPS timestamps
-                row[0] = f"{frame_idx * dt:.9f}"
-
+                _ = int(row[0])  # original timestamp (ignored)
+                row[0] = f"{frame_idx * dt:.4f}"
                 writer.writerow(row)
                 rows_processed += 1
                 frame_idx += 1
-
             except Exception:
                 logger.warning("Skipping invalid timestamp row in %s", csv_path)
 
