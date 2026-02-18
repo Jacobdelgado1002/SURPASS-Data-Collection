@@ -227,7 +227,7 @@ def process_episode(
         ]:
             if images.size > 0:
                 frame[f"observation.images.{cam_name}"] = images[i]
-        timestamp_sec = kinematics_data["timestamp"][i] * 1e-9  ## turn nano sec to sec
+        timestamp_sec = kinematics_data["timestamp"][i]
         dataset.add_frame(frame, task=subtask_prompt, timestamp=timestamp_sec)
 
     return dataset
