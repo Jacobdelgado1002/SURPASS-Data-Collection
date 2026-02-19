@@ -83,7 +83,6 @@ Notes:
 """
 
 import argparse
-import bisect
 import os
 import shutil
 import sys
@@ -108,16 +107,19 @@ except ImportError:
     try:
         current_dir = Path(__file__).parent
         if str(current_dir) not in sys.path:
-            sys.path.append(str(current_dir))
+            sys.path.insert(0, str(current_dir))
         from sync_image_kinematics import (
             extract_timestamp_from_filename,
             process_episode_sync,
         )
-    except ImportError:
+    except ImportError as e:
+        import traceback
         print(
             "Error: Could not import sync_image_kinematics. "
             "Ensure it is in the same directory or Python path."
         )
+        print(f"Root cause: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
 # ---------------------------------------------------------------------
@@ -469,64 +471,58 @@ def load_camera_timestamps(
     return candidates
 
 
-def find_best_camera_match(
-    left_ts: int,
-    candidate_timestamps: List[int],
-    candidates: List[Tuple[int, str]],
+def find_all_camera_matches_vectorized(
+    left_timestamps: np.ndarray,
+    candidate_timestamps: np.ndarray,
     max_diff_ns: float,
-) -> Optional[str]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Find best matching frame from secondary camera for given left timestamp.
+    Vectorized multi-camera matching for ALL left timestamps at once.
 
-    Uses binary search to find candidates, then selects the one with
-    minimum time difference within threshold.
+    Uses numpy searchsorted to find the closest candidate timestamp for
+    every left timestamp in a single vectorized pass.
 
     Args:
-        left_ts: Left camera timestamp in nanoseconds.
-        candidate_timestamps: Sorted list of candidate timestamps.
-        candidates: List of (timestamp, filename) tuples.
-        max_diff_ns: Maximum allowed difference in nanoseconds.
+        left_timestamps: Array of left-camera timestamps (int64, sorted).
+        candidate_timestamps: Array of secondary-camera timestamps (int64, sorted).
+        max_diff_ns: Maximum allowed time difference in nanoseconds.
 
     Returns:
-        Filename of best match if within threshold, None otherwise.
+        Tuple of:
+            - best_indices: Array of indices into candidate_timestamps for
+              each left timestamp (closest match). Invalid entries where
+              the match exceeds the threshold are still present but masked.
+            - valid_mask: Boolean array. True where the closest match is
+              within max_diff_ns threshold.
 
     Algorithm:
-        - Binary search to find insertion point
-        - Check both neighbors (idx and idx-1)
-        - Select absolute minimum distance
-        - Return None if minimum exceeds threshold
+        - np.searchsorted for bulk insertion-point lookup
+        - Compare both neighbors (idx and idx-1) vectorized
+        - Apply threshold mask
 
     Notes:
-        - Handles edge cases (empty list, out of bounds)
-        - Returns None rather than raising errors
+        - Returns empty arrays if candidate_timestamps is empty
     """
-    if not candidate_timestamps:
-        return None
+    if len(candidate_timestamps) == 0:
+        return (
+            np.zeros(len(left_timestamps), dtype=np.int64),
+            np.zeros(len(left_timestamps), dtype=bool),
+        )
 
-    # Binary search for insertion point
-    idx: int = bisect.bisect_left(candidate_timestamps, left_ts)
+    idx = np.searchsorted(candidate_timestamps, left_timestamps)
+    idx = np.clip(idx, 0, len(candidate_timestamps) - 1)
+    prev = np.clip(idx - 1, 0, len(candidate_timestamps) - 1)
 
-    best_match_file: Optional[str] = None
-    best_diff: float = float("inf")
+    diff_curr = np.abs(candidate_timestamps[idx] - left_timestamps)
+    diff_prev = np.abs(candidate_timestamps[prev] - left_timestamps)
 
-    # Check candidates at idx and idx-1
-    check_indices: List[int] = []
-    if idx < len(candidates):
-        check_indices.append(idx)
-    if idx > 0:
-        check_indices.append(idx - 1)
+    use_prev = diff_prev < diff_curr
+    best_indices = np.where(use_prev, prev, idx)
+    best_diffs = np.where(use_prev, diff_prev, diff_curr)
 
-    for i in check_indices:
-        diff: float = abs(candidates[i][0] - left_ts)
-        if diff < best_diff:
-            best_diff = diff
-            best_match_file = candidates[i][1]
+    valid_mask = best_diffs <= max_diff_ns
 
-    # Return match only if within threshold
-    if best_match_file and best_diff <= max_diff_ns:
-        return best_match_file
-    else:
-        return None
+    return best_indices, valid_mask
 
 
 # ---------------------------------------------------------------------
@@ -537,55 +533,30 @@ def find_best_camera_match(
 def copy_filtered_episode(
     episode_path: Path,
     out_dir: Path,
-    sync_result: Dict[str, Any],
+    filter_result: Dict[str, Any],
     validation: Dict[str, Any],
     source_root: Path,
     use_hardlink: bool = False,
-    max_time_diff: float = DEFAULT_MAX_TIME_DIFF_MS,
 ) -> bool:
     """
-    Copy filtered episode data to destination with multi-camera synchronization.
+    Copy pre-synchronised episode data to destination.
 
-    This function implements strict synchronization: a frame is kept only if
-    ALL cameras have matching frames within the time threshold. Secondary
-    camera frames are renamed to match the left camera timestamp to ensure
-    1:1 correspondence.
+    This is a pure file-copy function.  All synchronisation (left↔kinematic
+    and multi-camera) must already have been performed by
+    ``run_filter_episode()`` whose output is passed in as *filter_result*.
 
     Args:
         episode_path: Source episode path.
         out_dir: Destination root directory.
-        sync_result: Result dictionary from sync analysis containing
-            'valid_filenames' and 'sync_df'.
-        validation: Validation dictionary containing 'kinematics_file' path.
-        source_root: Root of source directory for calculating relative paths.
-        use_hardlink: If True, uses hardlinks instead of copying (faster,
-            requires source and out on same filesystem).
-        max_time_diff: Maximum time difference for sync in milliseconds.
+        filter_result: Output dict from ``run_filter_episode()`` containing
+            ``valid_left_filenames``, ``kinematics_indices``, and
+            ``secondary_camera_filenames``.
+        validation: Validation dict (must contain ``kinematics_file``).
+        source_root: Root of source tree for relative-path calculation.
+        use_hardlink: Use hardlinks instead of copying.
 
     Returns:
-        True if at least one fully synchronized frame was copied,
-        False otherwise.
-
-    Processing Steps:
-        1. Calculate destination path preserving relative structure
-        2. Load timestamps for all secondary cameras
-        3. For each valid left frame, find matches in all cameras
-        4. Keep frame only if ALL cameras have matches within threshold
-        5. Copy left frame with original name
-        6. Copy matched frames renamed to left timestamp
-        7. Filter and save kinematic data
-
-    Synchronization Rules:
-        - Left camera is the reference
-        - Frame dropped if any camera missing or out of threshold
-        - Secondary frames renamed: frame{left_ts}_{camera}.jpg
-        - Ensures exact 1:1 correspondence across modalities
-
-    Notes:
-        - Gracefully handles missing camera directories
-        - Uses hardlinks when possible for speed
-        - Creates destination directories as needed
-        - Returns False on any error (logged)
+        True if at least one frame was copied, False otherwise.
     """
     logger.info(f"Copying filtered episode: {episode_path.name}")
 
@@ -594,129 +565,52 @@ def copy_filtered_episode(
         try:
             rel: Path = episode_path.relative_to(source_root)
         except ValueError:
-            # Fallback if source_root is not a parent
             rel = Path(episode_path.name)
 
         dest_episode_dir: Path = out_dir / rel
         dest_episode_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Destination: {dest_episode_dir}")
 
-        # Valid filenames from left camera (synchronization source)
-        left_filenames: List[str] = sync_result["valid_filenames"]
+        left_filenames: List[str] = filter_result["valid_left_filenames"]
+        secondary_fnames: Dict[str, List[str]] = filter_result[
+            "secondary_camera_filenames"
+        ]
 
         if not left_filenames:
             logger.warning("No valid left filenames to copy")
-            return False
-
-        # Load timestamps for secondary cameras
-        camera_indices: Dict[str, List[Tuple[int, str]]] = {}
-
-        for src_name, suffix, dst_name in CAMERA_CONFIGS:
-            if src_name == "left_img_dir":
-                continue
-
-            candidates: List[Tuple[int, str]] = load_camera_timestamps(
-                episode_path, src_name, suffix
-            )
-            camera_indices[src_name] = candidates
-
-        # Pre-calculate timestamp lists for search efficiency
-        camera_timestamp_lists: Dict[str, List[int]] = {
-            name: [x[0] for x in candidates]
-            for name, candidates in camera_indices.items()
-        }
-
-        # Identify fully valid frames (all cameras match)
-        fully_valid_frames: List[Tuple[str, Dict[str, str]]] = []
-        max_camera_sync_diff_ns: float = max_time_diff * 1e6
-
-        logger.debug(
-            f"Matching {len(left_filenames)} left frames across "
-            f"{len(camera_indices)} cameras"
-        )
-
-        for left_fname in left_filenames:
-            try:
-                left_ts: int = extract_timestamp_from_filename(left_fname)
-            except ValueError:
-                logger.debug(f"Skipping invalid left filename: {left_fname}")
-                continue
-
-            matches: Dict[str, str] = {}
-            drop_frame: bool = False
-
-            # Check each secondary camera for match
-            for src_name, _, _ in CAMERA_CONFIGS:
-                if src_name == "left_img_dir":
-                    continue
-
-                # Skip if camera directory didn't exist
-                if src_name not in camera_timestamp_lists:
-                    continue
-
-                candidate_timestamps: List[int] = camera_timestamp_lists[src_name]
-
-                if not candidate_timestamps:
-                    # Camera exists but empty - drop frame
-                    drop_frame = True
-                    break
-
-                # Find best match
-                best_match: Optional[str] = find_best_camera_match(
-                    left_ts,
-                    candidate_timestamps,
-                    camera_indices[src_name],
-                    max_camera_sync_diff_ns,
-                )
-
-                if best_match:
-                    matches[src_name] = best_match
-                else:
-                    # No match within threshold - drop frame
-                    drop_frame = True
-                    break
-
-            if not drop_frame:
-                fully_valid_frames.append((left_fname, matches))
-
-        logger.info(
-            f"Fully synchronized: {len(fully_valid_frames)}/{len(left_filenames)} frames"
-        )
-
-        if not fully_valid_frames:
-            logger.warning("No frames passed multi-camera synchronization")
             return False
 
         # Create camera directories
         for _, _, dst_name in CAMERA_CONFIGS:
             (dest_episode_dir / dst_name).mkdir(exist_ok=True)
 
-        # Copy files
+        def _copy_or_link(src: Path, dst: Path) -> bool:
+            """Copy or hardlink a single file.  Returns True on success."""
+            try:
+                if use_hardlink:
+                    try:
+                        if dst.exists():
+                            dst.unlink()
+                        os.link(src, dst)
+                    except OSError:
+                        shutil.copy2(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+                return True
+            except Exception as e:
+                logger.error(f"Failed to copy {src.name}: {e}")
+                return False
+
         copied_count: int = 0
 
-        for left_fname, matches in fully_valid_frames:
-            # Copy left frame
-            src_left: Path = episode_path / "left_img_dir" / left_fname
-            dst_left: Path = dest_episode_dir / "left_img_dir" / left_fname
+        for i, left_fname in enumerate(left_filenames):
+            src_left = episode_path / "left_img_dir" / left_fname
+            dst_left = dest_episode_dir / "left_img_dir" / left_fname
 
             if not src_left.exists():
                 logger.warning(f"Source left frame missing: {src_left}")
                 continue
 
-            # Copy/link left frame
-            try:
-                if use_hardlink:
-                    try:
-                        if dst_left.exists():
-                            dst_left.unlink()
-                        os.link(src_left, dst_left)
-                    except OSError:
-                        # Fallback to copy if hardlink fails
-                        shutil.copy2(src_left, dst_left)
-                else:
-                    shutil.copy2(src_left, dst_left)
-            except Exception as e:
-                logger.error(f"Failed to copy left frame {left_fname}: {e}")
+            if not _copy_or_link(src_left, dst_left):
                 continue
 
             # Copy matched secondary frames (renamed to left timestamp)
@@ -725,46 +619,29 @@ def copy_filtered_episode(
             for src_name, suffix, dst_name in CAMERA_CONFIGS:
                 if src_name == "left_img_dir":
                     continue
-                if src_name not in matches:
+                if src_name not in secondary_fnames:
                     continue
 
-                match_fname: str = matches[src_name]
-                src_file: Path = episode_path / src_name / match_fname
+                match_fname = secondary_fnames[src_name][i]
+                src_file = episode_path / src_name / match_fname
+                new_name = f"{base_name}{suffix}"
+                dst_file = dest_episode_dir / dst_name / new_name
 
-                # New filename using left timestamp
-                new_name: str = f"{base_name}{suffix}"
-                dst_file: Path = dest_episode_dir / dst_name / new_name
-
-                if not src_file.exists():
+                if src_file.exists():
+                    _copy_or_link(src_file, dst_file)
+                else:
                     logger.warning(f"Source match missing: {src_file}")
-                    continue
-
-                try:
-                    if use_hardlink:
-                        try:
-                            if dst_file.exists():
-                                dst_file.unlink()
-                            os.link(src_file, dst_file)
-                        except OSError:
-                            shutil.copy2(src_file, dst_file)
-                    else:
-                        shutil.copy2(src_file, dst_file)
-                except Exception as e:
-                    logger.error(f"Failed to copy {src_name} frame: {e}")
-                    continue
 
             copied_count += 1
 
         logger.info(f"Copied {copied_count} fully synchronized frames")
 
         # Filter and save kinematics
-        kept_left_filenames: List[str] = [x[0] for x in fully_valid_frames]
-
         write_filtered_kinematics(
             dest_episode_dir=dest_episode_dir,
-            sync_df=sync_result["sync_df"],
+            sync_df=filter_result["sync_df"],
             validation=validation,
-            kept_filenames=kept_left_filenames,
+            kept_filenames=left_filenames,
         )
 
         return copied_count > 0
@@ -775,6 +652,165 @@ def copy_filtered_episode(
             exc_info=True,
         )
         return False
+
+
+# ---------------------------------------------------------------------
+# Single-Episode Filtering API (for external callers)
+# ---------------------------------------------------------------------
+
+
+def run_filter_episode(
+    episode_path: Union[str, Path],
+    max_time_diff_ms: float = DEFAULT_MAX_TIME_DIFF_MS,
+) -> Dict[str, Any]:
+    """
+    Run the full filtering pipeline on a single episode.
+
+    This is the primary entry point for external callers (e.g. the
+    accelerated LeRobot converter).  It encapsulates:
+        1. Left-camera ↔ kinematic synchronization with outlier removal
+           (via ``process_episode_sync``).
+        2. Vectorized multi-camera synchronization — every secondary camera
+           must also have a match within the same threshold, otherwise the
+           frame is dropped.
+
+    Args:
+        episode_path: Path to the episode directory.  Must contain
+            ``left_img_dir/``, ``right_img_dir/``, ``endo_psm1/``,
+            ``endo_psm2/`` and ``ee_csv.csv``.
+        max_time_diff_ms: Maximum allowed time difference in milliseconds.
+            Frames where *any* modality exceeds this are discarded.
+
+    Returns:
+        Dictionary with the following keys:
+
+        - **success** (*bool*) ``True`` if the pipeline produced at
+          least one fully-synchronised frame.
+        - **error** (*str*, optional) Human-readable error message when
+          ``success`` is ``False``.
+        - **valid_left_filenames** (*List[str]*) Left-camera filenames
+          that passed both sync stages, in chronological order.
+        - **kinematics_indices** (*np.ndarray[int]*) Row indices into the
+          original ``ee_csv.csv`` for each surviving frame.
+        - **secondary_camera_indices** (*Dict[str, np.ndarray[int]]*)
+          Per-camera arrays of indices into that camera's sorted frame list.
+          Keys are ``"right_img_dir"``, ``"endo_psm1"``, ``"endo_psm2"``.
+        - **num_valid** (*int*) Total number of fully-synchronised frames.
+        - **outliers_removed** (*int*) Frames removed during left↔kinematic
+          sync.
+        - **multicam_dropped** (*int*) Frames removed during multi-camera
+          sync.
+    """
+    episode_path = Path(episode_path)
+    max_time_diff_ns: float = max_time_diff_ms * 1e6
+
+    logger.info(f"run_filter_episode: {episode_path.name}  "
+                f"threshold={max_time_diff_ms:.1f}ms")
+
+    # ------------------------------------------------------------------
+    # Stage 1 – Left-camera ↔ kinematic synchronisation
+    # ------------------------------------------------------------------
+    sync_result = process_episode_sync(
+        episode_path=episode_path,
+        camera="left",
+        output_dir=None,
+        max_time_diff_ms=max_time_diff_ms,
+        plot=False,
+        save_results=False,
+    )
+
+    if not sync_result["success"]:
+        return {"success": False,
+                "error": sync_result.get("error", "Unknown sync error")}
+
+    valid_left_filenames: List[str] = sync_result["valid_filenames"]
+    sync_df: pd.DataFrame = sync_result["sync_df"]
+
+    if not valid_left_filenames:
+        return {"success": False,
+                "error": "No frames passed left↔kinematic sync threshold"}
+
+    logger.info(
+        f"  Left↔kinematic sync: {len(valid_left_filenames)} valid, "
+        f"{sync_result['outliers_removed']} outliers removed"
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 2 – Vectorized multi-camera synchronisation
+    # ------------------------------------------------------------------
+    # Get left-camera timestamps for the surviving frames
+    valid_left_ts = np.array(
+        [extract_timestamp_from_filename(f) for f in valid_left_filenames],
+        dtype=np.int64,
+    )
+
+    secondary_configs = [
+        ("right_img_dir", "_right.jpg"),
+        ("endo_psm1",     "_psm1.jpg"),
+        ("endo_psm2",     "_psm2.jpg"),
+    ]
+
+    combined_valid_mask = np.ones(len(valid_left_ts), dtype=bool)
+    secondary_match_indices: Dict[str, np.ndarray] = {}
+    cached_candidates: Dict[str, List[Tuple[int, str]]] = {}
+
+    for cam_dir, cam_suffix in secondary_configs:
+        cam_candidates = load_camera_timestamps(episode_path, cam_dir, cam_suffix)
+        cached_candidates[cam_dir] = cam_candidates
+        if not cam_candidates:
+            combined_valid_mask[:] = False
+            logger.warning(f"  {cam_dir} has no frames — all frames dropped")
+            break
+
+        cam_ts = np.array([t for t, _ in cam_candidates], dtype=np.int64)
+        best_idx, valid_mask = find_all_camera_matches_vectorized(
+            valid_left_ts, cam_ts, max_time_diff_ns,
+        )
+        combined_valid_mask &= valid_mask
+        secondary_match_indices[cam_dir] = best_idx
+
+    fully_valid_positions = np.where(combined_valid_mask)[0]
+    n_dropped_multicam = len(valid_left_ts) - len(fully_valid_positions)
+
+    logger.info(
+        f"  Multi-camera sync: {len(fully_valid_positions)} fully synced, "
+        f"{n_dropped_multicam} dropped (camera mismatch)"
+    )
+
+    if len(fully_valid_positions) == 0:
+        return {"success": False,
+                "error": "No frames passed multi-camera sync threshold"}
+
+    # ------------------------------------------------------------------
+    # Build result
+    # ------------------------------------------------------------------
+    final_filenames = [valid_left_filenames[i] for i in fully_valid_positions]
+    final_kinematics_indices = sync_df["kinematics_idx"].values[fully_valid_positions]
+    final_secondary_indices = {
+        cam: idx_arr[fully_valid_positions]
+        for cam, idx_arr in secondary_match_indices.items()
+    }
+
+    # Materialise matched filenames using the cached candidates.
+    final_secondary_filenames: Dict[str, List[str]] = {}
+    for cam_dir, cam_suffix in secondary_configs:
+        if cam_dir in secondary_match_indices:
+            indices = final_secondary_indices[cam_dir]
+            final_secondary_filenames[cam_dir] = [
+                cached_candidates[cam_dir][idx][1] for idx in indices
+            ]
+
+    return {
+        "success": True,
+        "valid_left_filenames": final_filenames,
+        "kinematics_indices": final_kinematics_indices,
+        "secondary_camera_indices": final_secondary_indices,
+        "secondary_camera_filenames": final_secondary_filenames,
+        "sync_df": sync_df,
+        "num_valid": len(final_filenames),
+        "outliers_removed": sync_result["outliers_removed"],
+        "multicam_dropped": n_dropped_multicam,
+    }
 
 
 # ---------------------------------------------------------------------
@@ -869,20 +905,20 @@ def process_single_episode(
 
     result_stats["valid_structure"] = True
 
-    # Run synchronization analysis
-    sync_result: Dict[str, Any] = run_sync_analysis_direct(
+    # Run full sync + multi-camera filtering via the single entry point
+    filter_result: Dict[str, Any] = run_filter_episode(
         episode_path, max_time_diff
     )
 
-    if not sync_result["success"]:
+    if not filter_result["success"]:
         result_stats["skipped_reason"] = (
-            f"Sync failed: {sync_result.get('error', 'Unknown')}"
+            f"Sync failed: {filter_result.get('error', 'Unknown')}"
         )
         logger.debug(f"Sync failed: {result_stats['skipped_reason']}")
         return result_stats
 
     result_stats["sync_successful"] = True
-    num_valid: int = sync_result["num_valid_images"]
+    num_valid: int = filter_result["num_valid"]
 
     # Check minimum images threshold
     if num_valid < min_images:
@@ -895,18 +931,17 @@ def process_single_episode(
         success: bool = copy_filtered_episode(
             episode_path,
             out_dir,
-            sync_result,
+            filter_result,
             validation,
             source_root,
             use_hardlink,
-            max_time_diff=max_time_diff,
         )
         if success:
             result_stats["copied"] = True
             result_stats["images_copied"] = num_valid
             logger.info(f"Successfully processed: {episode_path.name}")
         else:
-            result_stats["skipped_reason"] = "Copy failed (multi-camera sync)"
+            result_stats["skipped_reason"] = "Copy failed"
             logger.warning(f"Copy failed: {episode_path.name}")
     else:
         # Dry run mode
@@ -916,6 +951,229 @@ def process_single_episode(
 
     return result_stats
 
+def run_filter_episodes(
+    source_dir: Union[str, Path],
+    out_dir: Union[str, Path],
+    max_time_diff: float = DEFAULT_MAX_TIME_DIFF_MS,
+    min_images: int = DEFAULT_MIN_IMAGES,
+    dry_run: bool = False,
+    workers: Optional[int] = None,
+    use_hardlink: bool = False,
+    overwrite: bool = False,
+) -> int:
+    """
+    Run the full batch filtering pipeline on a directory of episodes.
+
+    Discovers all episodes in *source_dir*, validates them, runs strict
+    synchronisation (left-camera <-> kinematics + multi-camera), and copies
+    the surviving frames to *out_dir*.
+
+    This function encapsulates the logic that was previously inlined in
+    ``main()``, making it callable from other scripts and GUIs.
+
+    Args:
+        source_dir: Root directory containing episode subdirectories.
+        out_dir: Destination root for filtered data.
+        max_time_diff: Maximum allowed time difference in milliseconds.
+        min_images: Minimum valid images per episode to keep it.
+        dry_run: If True, preview without copying files.
+        workers: Number of parallel workers (default: CPU count, max 8).
+        use_hardlink: Use hardlinks instead of file copies.
+        overwrite: Overwrite existing destination episodes.
+
+    Returns:
+        0 on success, 1 on error.
+    """
+    source_dir = Path(source_dir)
+    out_dir = Path(out_dir)
+
+    # Validate source
+    if not source_dir.exists():
+        logger.error(f"Source directory not found: {source_dir}")
+        print(f"Error: Source directory not found: {source_dir}")
+        return 1
+
+    # Create destination if not dry run
+    if not dry_run:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Log configuration
+    logger.info("=" * 70)
+    logger.info("Starting episode filtering pipeline")
+    logger.info(f"Source: {source_dir}")
+    logger.info(f"Destination: {out_dir}")
+    logger.info(f"Max time diff: {max_time_diff} ms")
+    logger.info(f"Min images: {min_images}")
+    logger.info(f"Dry run: {dry_run}")
+    logger.info(f"Hardlink: {use_hardlink}")
+    logger.info(f"Overwrite: {overwrite}")
+    logger.info("=" * 70)
+
+    # Print configuration to console
+    print(f"Processing episodes from: {source_dir}")
+    print(f"Destination directory: {out_dir}")
+    print(f"Max time difference: {max_time_diff} ms")
+    print(f"Min images required: {min_images}")
+    if workers:
+        print(f"Workers: {workers}")
+    if dry_run:
+        print("[DRY RUN MODE - No files will be copied]")
+    print("-" * 60)
+
+    # Find episodes
+    try:
+        episodes: List[Path] = find_episodes(str(source_dir))
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        print(f"Error: {e}")
+        return 1
+
+    if not episodes:
+        logger.warning("No episodes found in source directory")
+        print("No episodes found in source directory")
+        return 0
+
+    # Pre-filter episodes to skip existing destinations
+    episodes_to_process: List[Path] = []
+    skipped_pre: List[Tuple[str, str]] = []
+
+    for ep in episodes:
+        try:
+            rel = ep.relative_to(source_dir)
+        except ValueError:
+            rel = Path(ep.name)
+
+        dest_episode_dir = out_dir / rel
+
+        if dest_episode_dir.exists() and not overwrite and not dry_run:
+            skipped_pre.append((ep.name, "Destination already exists"))
+            continue
+
+        episodes_to_process.append(ep)
+
+    logger.info(
+        f"Processing {len(episodes_to_process)} episodes "
+        f"({len(skipped_pre)} pre-filtered)"
+    )
+
+    # Initialize statistics
+    stats: Dict[str, Any] = {
+        "total_episodes": len(episodes),
+        "valid_structure": 0,
+        "sync_successful": 0,
+        "copied_episodes": 0,
+        "total_images_copied": 0,
+        "skipped_episodes": skipped_pre.copy(),
+    }
+
+    # Determine worker count
+    max_procs: int = min(workers or os.cpu_count() or 1, MAX_WORKERS)
+    logger.info(f"Using {max_procs} parallel workers")
+
+    # Process episodes in parallel
+    try:
+        with ProcessPoolExecutor(max_workers=max_procs) as executor:
+            # Submit all tasks
+            futures = {
+                executor.submit(
+                    process_single_episode,
+                    episode,
+                    out_dir,
+                    "",  # sync_script_path unused
+                    max_time_diff,
+                    min_images,
+                    source_dir,
+                    dry_run,
+                    use_hardlink,
+                    overwrite,
+                ): episode
+                for episode in episodes_to_process
+            }
+
+            # Process results with progress bar
+            with tqdm(
+                total=len(futures),
+                desc="Processing episodes",
+                unit="episode",
+                ncols=100,
+            ) as pbar:
+                for future in futures:
+                    try:
+                        result: Dict[str, Any] = future.result()
+
+                        # Update statistics
+                        if result["valid_structure"]:
+                            stats["valid_structure"] += 1
+                        if result["sync_successful"]:
+                            stats["sync_successful"] += 1
+                        if result["copied"]:
+                            stats["copied_episodes"] += 1
+                            stats["total_images_copied"] += result["images_copied"]
+
+                        if result["skipped_reason"]:
+                            stats["skipped_episodes"].append(
+                                (result["name"], result["skipped_reason"])
+                            )
+
+                        # Update progress bar
+                        pbar.set_postfix(
+                            {
+                                "copied": stats["copied_episodes"],
+                                "skipped": len(stats["skipped_episodes"]),
+                                "images": stats["total_images_copied"],
+                            }
+                        )
+
+                    except Exception as e:
+                        episode = futures[future]
+                        logger.error(
+                            f"Exception processing {episode.name}: {e}",
+                            exc_info=True,
+                        )
+                        stats["skipped_episodes"].append(
+                            (episode.name, f"Exception: {str(e)}")
+                        )
+                        pbar.set_postfix(
+                            {
+                                "copied": stats["copied_episodes"],
+                                "skipped": len(stats["skipped_episodes"]),
+                                "error": episode.name[:20],
+                            }
+                        )
+                    finally:
+                        pbar.update(1)
+
+    except KeyboardInterrupt:
+        logger.warning("Processing interrupted by user (Ctrl+C)")
+        print("\n\nProcessing interrupted by user")
+        return 1
+
+    # Print final summary
+    print("\n" + "=" * 60)
+    print("PROCESSING SUMMARY")
+    print("=" * 60)
+    print(f"Total episodes found: {stats['total_episodes']}")
+    print(f"Episodes with valid structure: {stats['valid_structure']}")
+    print(f"Episodes with successful sync: {stats['sync_successful']}")
+    print(f"Episodes copied: {stats['copied_episodes']}")
+    print(f"Total images copied: {stats['total_images_copied']}")
+    print(f"Episodes skipped: {len(stats['skipped_episodes'])}")
+
+    if stats["skipped_episodes"]:
+        print("\nSkipped episodes:")
+        for episode_name, reason in stats["skipped_episodes"]:
+            print(f"  - {episode_name}: {reason}")
+
+    if dry_run:
+        print("\n[DRY RUN] No files were actually copied.")
+
+    print("=" * 60)
+
+    logger.info("Processing complete")
+    logger.info(f"Copied {stats['copied_episodes']} episodes")
+    logger.info(f"Total images copied: {stats['total_images_copied']}")
+
+    return 0
 
 # ---------------------------------------------------------------------
 # Main Entry Point
@@ -1039,197 +1297,16 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # Setup paths
-    source_dir: Path = Path(args.source_dir)
-    out_dir: Path = Path(args.out_dir)
-
-    # Validate source
-    if not source_dir.exists():
-        logger.error(f"Source directory not found: {source_dir}")
-        print(f"Error: Source directory not found: {source_dir}")
-        return 1
-
-    # Create destination if not dry run
-    if not args.dry_run:
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Log configuration
-    logger.info("=" * 70)
-    logger.info("Starting episode filtering pipeline")
-    logger.info(f"Source: {source_dir}")
-    logger.info(f"Destination: {out_dir}")
-    logger.info(f"Max time diff: {args.max_time_diff} ms")
-    logger.info(f"Min images: {args.min_images}")
-    logger.info(f"Dry run: {args.dry_run}")
-    logger.info(f"Hardlink: {args.hardlink}")
-    logger.info(f"Overwrite: {args.overwrite}")
-    logger.info("=" * 70)
-
-    # Print configuration to console
-    print(f"Processing episodes from: {source_dir}")
-    print(f"Destination directory: {out_dir}")
-    print(f"Max time difference: {args.max_time_diff} ms")
-    print(f"Min images required: {args.min_images}")
-    if args.workers:
-        print(f"Workers: {args.workers}")
-    if args.dry_run:
-        print("[DRY RUN MODE - No files will be copied]")
-    print("-" * 60)
-
-    # Find episodes
-    try:
-        episodes: List[Path] = find_episodes(str(source_dir))
-    except FileNotFoundError as e:
-        logger.error(str(e))
-        print(f"Error: {e}")
-        return 1
-
-    if not episodes:
-        logger.warning("No episodes found in source directory")
-        print("No episodes found in source directory")
-        return 0
-
-    # Pre-filter episodes to skip existing destinations
-    episodes_to_process: List[Path] = []
-    skipped_pre: List[Tuple[str, str]] = []
-
-    for ep in episodes:
-        try:
-            rel = ep.relative_to(source_dir)
-        except ValueError:
-            rel = Path(ep.name)
-
-        dest_episode_dir = out_dir / rel
-
-        if dest_episode_dir.exists() and not args.overwrite and not args.dry_run:
-            skipped_pre.append((ep.name, "Destination already exists"))
-            continue
-
-        episodes_to_process.append(ep)
-
-    logger.info(
-        f"Processing {len(episodes_to_process)} episodes "
-        f"({len(skipped_pre)} pre-filtered)"
+    return run_filter_episodes(
+        source_dir=Path(args.source_dir),
+        out_dir=Path(args.out_dir),
+        max_time_diff=args.max_time_diff,
+        min_images=args.min_images,
+        dry_run=args.dry_run,
+        workers=args.workers,
+        use_hardlink=args.hardlink,
+        overwrite=args.overwrite,
     )
-
-    # Initialize statistics
-    stats: Dict[str, Any] = {
-        "total_episodes": len(episodes),
-        "valid_structure": 0,
-        "sync_successful": 0,
-        "copied_episodes": 0,
-        "total_images_copied": 0,
-        "skipped_episodes": skipped_pre.copy(),
-    }
-
-    # Determine worker count
-    max_procs: int = min(args.workers or os.cpu_count() or 1, MAX_WORKERS)
-    logger.info(f"Using {max_procs} parallel workers")
-
-    # Process episodes in parallel
-    try:
-        with ProcessPoolExecutor(max_workers=max_procs) as executor:
-            # Submit all tasks
-            futures = {
-                executor.submit(
-                    process_single_episode,
-                    episode,
-                    out_dir,
-                    "",  # sync_script_path unused
-                    args.max_time_diff,
-                    args.min_images,
-                    source_dir,
-                    args.dry_run,
-                    args.hardlink,
-                    args.overwrite,
-                ): episode
-                for episode in episodes_to_process
-            }
-
-            # Process results with progress bar
-            with tqdm(
-                total=len(futures),
-                desc="Processing episodes",
-                unit="episode",
-                ncols=100,
-            ) as pbar:
-                for future in futures:
-                    try:
-                        result: Dict[str, Any] = future.result()
-
-                        # Update statistics
-                        if result["valid_structure"]:
-                            stats["valid_structure"] += 1
-                        if result["sync_successful"]:
-                            stats["sync_successful"] += 1
-                        if result["copied"]:
-                            stats["copied_episodes"] += 1
-                            stats["total_images_copied"] += result["images_copied"]
-
-                        if result["skipped_reason"]:
-                            stats["skipped_episodes"].append(
-                                (result["name"], result["skipped_reason"])
-                            )
-
-                        # Update progress bar
-                        pbar.set_postfix(
-                            {
-                                "copied": stats["copied_episodes"],
-                                "skipped": len(stats["skipped_episodes"]),
-                                "images": stats["total_images_copied"],
-                            }
-                        )
-
-                    except Exception as e:
-                        episode = futures[future]
-                        logger.error(
-                            f"Exception processing {episode.name}: {e}",
-                            exc_info=True,
-                        )
-                        stats["skipped_episodes"].append(
-                            (episode.name, f"Exception: {str(e)}")
-                        )
-                        pbar.set_postfix(
-                            {
-                                "copied": stats["copied_episodes"],
-                                "skipped": len(stats["skipped_episodes"]),
-                                "error": episode.name[:20],
-                            }
-                        )
-                    finally:
-                        pbar.update(1)
-
-    except KeyboardInterrupt:
-        logger.warning("Processing interrupted by user (Ctrl+C)")
-        print("\n\nProcessing interrupted by user")
-        return 1
-
-    # Print final summary
-    print("\n" + "=" * 60)
-    print("PROCESSING SUMMARY")
-    print("=" * 60)
-    print(f"Total episodes found: {stats['total_episodes']}")
-    print(f"Episodes with valid structure: {stats['valid_structure']}")
-    print(f"Episodes with successful sync: {stats['sync_successful']}")
-    print(f"Episodes copied: {stats['copied_episodes']}")
-    print(f"Total images copied: {stats['total_images_copied']}")
-    print(f"Episodes skipped: {len(stats['skipped_episodes'])}")
-
-    if stats["skipped_episodes"]:
-        print("\nSkipped episodes:")
-        for episode_name, reason in stats["skipped_episodes"]:
-            print(f"  - {episode_name}: {reason}")
-
-    if args.dry_run:
-        print("\n[DRY RUN] No files were actually copied.")
-
-    print("=" * 60)
-
-    logger.info("Processing complete")
-    logger.info(f"Copied {stats['copied_episodes']} episodes")
-    logger.info(f"Total images copied: {stats['total_images_copied']}")
-
-    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

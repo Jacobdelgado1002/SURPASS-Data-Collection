@@ -41,6 +41,18 @@ from PyQt5.QtGui import QFont
 # Note: LeRobot imports are delayed until inside ConversionWorker
 # to allow setting HF_LEROBOT_HOME before module initialization
 
+# ---------------------------------------------------------------------------
+# Import strict synchronization pipeline.
+# These scripts are NOT installed as packages, so we add to sys.path.
+# ---------------------------------------------------------------------------
+_SYNC_SCRIPTS_DIR = str(
+    Path(__file__).resolve().parent.parent.parent / "sync_image_kinematics"
+)
+if _SYNC_SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SYNC_SCRIPTS_DIR)
+
+from filter_episodes import run_filter_episode
+
 # Default LeRobot home for UI display only
 DEFAULT_LEROBOT_HOME = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "lerobot")
 
@@ -686,46 +698,64 @@ class ConversionWorker(QThread):
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     def _process_episode(self, dataset, episode_path: Path):
-        """Process a single episode with timestamp-based alignment.
+        """Process a single episode with strict timestamp-based synchronization.
 
-        Optimisations:
-        - Vectorized alignment: ALL indices computed in one numpy pass
+        Delegates sync + filtering to ``run_filter_episode()`` which handles:
+        1. Left-camera <-> kinematic sync with outlier removal
+        2. Vectorized multi-camera sync (all cameras within threshold)
+
+        The threshold is derived from fps: ``max_time_diff_ms = 1000 / fps``.
+
+        Optimisations preserved:
         - Deep pipeline: 16 worker threads pre-build frame dicts ahead
         - cv2.imread: faster JPEG decoding (releases GIL)
         - Pre-computed state/action matrices
         """
         t_start = time.time()
 
+        # Derive sync threshold from fps: one frame period
+        max_time_diff_ms = self.fps
+
         # ------------------------------------------------------------------
-        # 1. Load frame lists from each camera directory
+        # 1. Run full sync + multi-camera filtering
         # ------------------------------------------------------------------
-        left_frames = load_frames_from_dir(episode_path / LEFT_IMG_DIR)
+        self.log_message.emit(
+            f"  Running strict sync (threshold={max_time_diff_ms:.1f}ms)..."
+        )
+        filt = run_filter_episode(episode_path, max_time_diff_ms)
+
+        if not filt["success"]:
+            raise ValueError(f"Sync failed: {filt.get('error', 'Unknown')}")
+
+        valid_left_filenames = filt["valid_left_filenames"]
+        kinematics_indices  = filt["kinematics_indices"]
+        secondary_indices   = filt["secondary_camera_indices"]
+
+        self.log_message.emit(
+            f"  Sync complete: {filt['num_valid']} synced frames "
+            f"({filt['outliers_removed']} kinematic outliers, "
+            f"{filt['multicam_dropped']} camera mismatches removed)"
+        )
+
+        t_sync = time.time()
+
+        # ------------------------------------------------------------------
+        # 2. Load frame lists and map filenames to paths
+        # ------------------------------------------------------------------
+        left_frames  = load_frames_from_dir(episode_path / LEFT_IMG_DIR)
         right_frames = load_frames_from_dir(episode_path / RIGHT_IMG_DIR)
-        psm1_frames = load_frames_from_dir(episode_path / ENDO_PSM1_DIR)
-        psm2_frames = load_frames_from_dir(episode_path / ENDO_PSM2_DIR)
+        psm1_frames  = load_frames_from_dir(episode_path / ENDO_PSM1_DIR)
+        psm2_frames  = load_frames_from_dir(episode_path / ENDO_PSM2_DIR)
 
         if not left_frames:
             raise ValueError("No frames in left_img_dir")
 
-        t_listing = time.time()
-
-        # ------------------------------------------------------------------
-        # 2. Vectorized alignment: compute ALL indices in one numpy pass
-        # ------------------------------------------------------------------
-        left_ts = np.array([f.timestamp for f in left_frames], dtype=np.int64)
-
-        right_ts = np.array([f.timestamp for f in right_frames], dtype=np.int64) if right_frames else None
-        psm1_ts = np.array([f.timestamp for f in psm1_frames], dtype=np.int64) if psm1_frames else None
-        psm2_ts = np.array([f.timestamp for f in psm2_frames], dtype=np.int64) if psm2_frames else None
-
-        def _find_all(targets, candidates):
-            """Vectorized closest-index for ALL targets at once."""
-            idx = np.searchsorted(candidates, targets)
-            idx = np.clip(idx, 0, len(candidates) - 1)
-            prev = np.clip(idx - 1, 0, len(candidates) - 1)
-            use_prev = np.abs(candidates[prev] - targets) < np.abs(candidates[idx] - targets)
-            idx[use_prev] = prev[use_prev]
-            return idx
+        # Map valid left filenames -> indices in left_frames
+        left_fname_to_idx = {f.path.name: i for i, f in enumerate(left_frames)}
+        final_left_indices = np.array(
+            [left_fname_to_idx[fn] for fn in valid_left_filenames],
+            dtype=np.int64,
+        )
 
         # ------------------------------------------------------------------
         # 3. Load CSV & pre-compute state/action matrices
@@ -733,27 +763,17 @@ class ConversionWorker(QThread):
         csv_path = episode_path / CSV_FILE
         df = pd.read_csv(csv_path)
 
-        if 'timestamp' not in df.columns:
-            raise ValueError("CSV missing required 'timestamp' column")
-
-        csv_timestamps = df['timestamp'].values.astype(np.int64)
-        csv_indices = _find_all(left_ts, csv_timestamps)
-
-        right_indices = _find_all(left_ts, right_ts) if right_ts is not None else None
-        psm1_indices = _find_all(left_ts, psm1_ts) if psm1_ts is not None else None
-        psm2_indices = _find_all(left_ts, psm2_ts) if psm2_ts is not None else None
-
-        state_cols = [c for c in STATES_NAME if c in df.columns]
+        state_cols  = [c for c in STATES_NAME  if c in df.columns]
         action_cols = [c for c in ACTIONS_NAME if c in df.columns]
-        states_matrix = df[state_cols].values.astype(np.float32)   # (N, 16)
-        actions_matrix = df[action_cols].values.astype(np.float32)  # (N, 16)
+        states_matrix  = df[state_cols].values.astype(np.float32)
+        actions_matrix = df[action_cols].values.astype(np.float32)
 
         t_prep = time.time()
 
-        total_frames = len(left_frames)
+        total_frames = len(final_left_indices)
         self.log_message.emit(
-            f"  Processing {total_frames} frames "
-            f"(listing: {t_listing - t_start:.1f}s, prep: {t_prep - t_listing:.1f}s)..."
+            f"  Processing {total_frames} synchronized frames "
+            f"(sync: {t_sync - t_start:.1f}s, prep: {t_prep - t_sync:.1f}s)..."
         )
 
         # ------------------------------------------------------------------
@@ -761,24 +781,30 @@ class ConversionWorker(QThread):
         #    16 workers pre-build frame dicts (image loading + dict assembly)
         #    while the main thread just calls add_frame().
         # ------------------------------------------------------------------
-        PIPELINE_DEPTH = 64   # frames to pre-build ahead
-        NUM_WORKERS = 16      # worker threads for image loading
+        PIPELINE_DEPTH = 64
+        NUM_WORKERS = 16
 
         fps_inv = 1.0 / self.fps
         t_add_total = 0.0
 
         # Pre-build path lists for fast indexing
-        left_paths = [f.path for f in left_frames]
+        left_paths  = [f.path for f in left_frames]
         right_paths = [f.path for f in right_frames] if right_frames else None
-        psm1_paths = [f.path for f in psm1_frames] if psm1_frames else None
-        psm2_paths = [f.path for f in psm2_frames] if psm2_frames else None
+        psm1_paths  = [f.path for f in psm1_frames] if psm1_frames else None
+        psm2_paths  = [f.path for f in psm2_frames] if psm2_frames else None
 
-        def _build_frame(idx):
-            """Build a complete frame dict — runs in worker thread.
+        # Secondary camera index arrays (already final from run_filter_episode)
+        right_idx_arr = secondary_indices.get("right_img_dir")
+        psm1_idx_arr  = secondary_indices.get("endo_psm1")
+        psm2_idx_arr  = secondary_indices.get("endo_psm2")
+
+        def _build_frame(out_idx):
+            """Build a complete frame dict -- runs in worker thread.
             cv2.imread releases the GIL so threads truly run in parallel."""
-            csv_idx = csv_indices[idx]
+            left_idx = final_left_indices[out_idx]
+            csv_idx  = kinematics_indices[out_idx]
 
-            left_img = self._load_image_cv2(left_paths[idx])
+            left_img = self._load_image_cv2(left_paths[left_idx])
 
             frame = {
                 "observation.state": states_matrix[csv_idx],
@@ -789,17 +815,17 @@ class ConversionWorker(QThread):
                 "observation.images.endoscope.left": left_img,
             }
 
-            if right_indices is not None:
+            if right_idx_arr is not None and right_paths:
                 frame["observation.images.endoscope.right"] = self._load_image_cv2(
-                    right_paths[right_indices[idx]]
+                    right_paths[right_idx_arr[out_idx]]
                 )
-            if psm1_indices is not None:
+            if psm1_idx_arr is not None and psm1_paths:
                 frame["observation.images.wrist.right"] = self._load_image_cv2(
-                    psm1_paths[psm1_indices[idx]]
+                    psm1_paths[psm1_idx_arr[out_idx]]
                 )
-            if psm2_indices is not None:
+            if psm2_idx_arr is not None and psm2_paths:
                 frame["observation.images.wrist.left"] = self._load_image_cv2(
-                    psm2_paths[psm2_indices[idx]]
+                    psm2_paths[psm2_idx_arr[out_idx]]
                 )
             return frame
 
@@ -815,19 +841,16 @@ class ConversionWorker(QThread):
             if frame_idx > 0 and frame_idx % 500 == 0:
                 avg_add = (t_add_total / frame_idx) * 1000
                 self.log_message.emit(
-                    f"    → {frame_idx}/{total_frames} "
+                    f"    -> {frame_idx}/{total_frames} "
                     f"(avg add_frame={avg_add:.1f}ms)"
                 )
 
-            # Wait for this frame's pre-built dict (should already be ready)
             frame = futures.pop(frame_idx).result()
 
-            # Keep the pipeline full — submit the next frame
             next_idx = frame_idx + PIPELINE_DEPTH
             if next_idx < total_frames:
                 futures[next_idx] = pool.submit(_build_frame, next_idx)
 
-            # Add to dataset (must be serial — modifies dataset internal state)
             t0 = time.time()
             dataset.add_frame(frame, task=self.task_text, timestamp=frame_idx * fps_inv)
             t_add_total += time.time() - t0
@@ -836,9 +859,10 @@ class ConversionWorker(QThread):
 
         t_end = time.time()
         self.log_message.emit(
-            f"    → {total_frames}/{total_frames} frames processed (100%) "
+            f"    -> {total_frames}/{total_frames} frames processed (100%) "
             f"| total: {t_end - t_start:.1f}s "
-            f"(prep: {t_prep - t_start:.1f}s, "
+            f"(sync: {t_sync - t_start:.1f}s, "
+            f"prep: {t_prep - t_sync:.1f}s, "
             f"add_frame: {t_add_total:.1f}s, "
             f"pipeline overhead: {(t_end - t_prep) - t_add_total:.1f}s)"
         )
