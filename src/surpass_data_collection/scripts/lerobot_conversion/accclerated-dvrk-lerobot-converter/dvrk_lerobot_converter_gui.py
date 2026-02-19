@@ -51,7 +51,14 @@ _SYNC_SCRIPTS_DIR = str(
 if _SYNC_SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SYNC_SCRIPTS_DIR)
 
-from filter_episodes import run_filter_episode
+_POST_PROCESSING_DIR = str(
+    Path(__file__).resolve().parent.parent.parent / "post_processing"
+)
+if _POST_PROCESSING_DIR not in sys.path:
+    sys.path.insert(0, _POST_PROCESSING_DIR)
+
+from filter_episodes import run_filter_episode, run_filter_episodes
+from slice_affordance import plan_episodes, list_sorted_frames, extract_timestamp as sa_extract_timestamp
 
 # Default LeRobot home for UI display only
 DEFAULT_LEROBOT_HOME = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "lerobot")
@@ -425,19 +432,21 @@ class ConversionWorker(QThread):
     progress = pyqtSignal(int, int)  # current, total
     log_message = pyqtSignal(str)
     episode_started = pyqtSignal(str)
+    eta_update = pyqtSignal(str)  # formatted ETA string
     finished_signal = pyqtSignal(bool, str)  # success, message
     
     def __init__(self, source_path: Path, output_dir: Path, dataset_name: str,
-                 task_text: str, psm1_tool: str, psm2_tool: str, fps: int,
+                 psm1_tool: str, psm2_tool: str, fps: int,
+                 annotations_dir: Optional[Path] = None,
                  resume_mode: bool = False, skip_count: int = 0):
         super().__init__()
         self.source_path = source_path
         self.output_dir = output_dir
         self.dataset_name = dataset_name
-        self.task_text = task_text
         self.psm1_tool = psm1_tool
         self.psm2_tool = psm2_tool
         self.fps = fps
+        self.annotations_dir = annotations_dir
         self.resume_mode = resume_mode
         self.skip_count = skip_count
         self.cancelled = False
@@ -450,6 +459,18 @@ class ConversionWorker(QThread):
             self._run_conversion()
         except Exception as e:
             self.finished_signal.emit(False, f"Error: {str(e)}\n{traceback.format_exc()}")
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Format a duration in seconds to a human-readable string."""
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, secs = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {secs:02d}s"
+        hours, mins = divmod(minutes, 60)
+        return f"{hours}h {mins:02d}m {secs:02d}s"
     
     def _run_conversion(self):
         # Set HF_LEROBOT_HOME BEFORE importing LeRobot modules
@@ -458,156 +479,379 @@ class ConversionWorker(QThread):
         # Now import LeRobot (this will use the custom HF_LEROBOT_HOME)
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         from lerobot.datasets.utils import write_info
-        
-        # Find all episode directories
-        episodes = sorted([d for d in self.source_path.iterdir() if d.is_dir()], 
-                         key=lambda x: x.name)
-        
-        if not episodes:
-            self.finished_signal.emit(False, "No episode directories found in source path")
+
+        if self.annotations_dir:
+            self._run_pipeline_conversion(LeRobotDataset, write_info)
+        else:
+            self._run_flat_conversion(LeRobotDataset, write_info)
+
+    # -----------------------------------------------------------------
+    # Dataset creation helpers (shared by pipeline and flat modes)
+    # -----------------------------------------------------------------
+
+    def _create_dataset(self, LeRobotDataset, img_shape_endo, img_shape_wrist):
+        """Create a fresh LeRobot dataset with the standard feature schema."""
+        dataset = LeRobotDataset.create(
+            repo_id=self.dataset_name,
+            use_videos=True,
+            robot_type="dvrk",
+            fps=self.fps,
+            features={
+                "observation.images.endoscope.left": {
+                    "dtype": "video",
+                    "shape": img_shape_endo,
+                    "names": ["height", "width", "channel"],
+                },
+                "observation.images.endoscope.right": {
+                    "dtype": "video",
+                    "shape": img_shape_endo,
+                    "names": ["height", "width", "channel"],
+                },
+                "observation.images.wrist.left": {
+                    "dtype": "video",
+                    "shape": img_shape_wrist,
+                    "names": ["height", "width", "channel"],
+                },
+                "observation.images.wrist.right": {
+                    "dtype": "video",
+                    "shape": img_shape_wrist,
+                    "names": ["height", "width", "channel"],
+                },
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": (len(STATES_NAME),),
+                    "names": [STATES_NAME],
+                },
+                "action": {
+                    "dtype": "float32",
+                    "shape": (len(ACTIONS_NAME),),
+                    "names": [ACTIONS_NAME],
+                },
+                "observation.meta.tool.psm1": {
+                    "dtype": "string",
+                    "shape": (1,),
+                    "names": ["value"],
+                },
+                "observation.meta.tool.psm2": {
+                    "dtype": "string",
+                    "shape": (1,),
+                    "names": ["value"],
+                },
+                "instruction.text": {
+                    "dtype": "string",
+                    "shape": (1,),
+                    "description": "Natural language command for the robot",
+                },
+            },
+            image_writer_processes=0,
+            image_writer_threads=16,
+            tolerance_s=0.1,
+            batch_encoding_size=1,  # Encode after each episode for crash resilience
+        )
+        _patch_parallel_encoding(dataset)
+        _patch_jpeg_image_saving(dataset)
+        self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
+        return dataset
+
+    def _init_resume_dataset(self, LeRobotDataset, output_path):
+        """Resume an existing dataset, cleaning up partial data."""
+        self.log_message.emit(f"Resuming: {self.skip_count} episodes already completed")
+
+        # Clean up stale intermediate images
+        for stale_dir in [output_path / "images",
+                          TEMP_IMAGE_DIR / "images" if TEMP_IMAGE_DIR else None]:
+            if stale_dir and stale_dir.exists():
+                self.log_message.emit(f"Cleaning up stale intermediate images in {stale_dir}...")
+                shutil.rmtree(stale_dir)
+
+        # Remove partial files for the first incomplete episode
+        partial_ep = f"episode_{self.skip_count:06d}"
+        for parquet in (output_path / "data").glob(f"chunk-*/{partial_ep}.parquet"):
+            self.log_message.emit(f"Removing partial parquet: {parquet.name}")
+            parquet.unlink()
+        videos_dir = output_path / "videos"
+        if videos_dir.exists():
+            for video_key_dir in videos_dir.iterdir():
+                partial_vid = video_key_dir / f"{partial_ep}.mp4"
+                if partial_vid.exists():
+                    self.log_message.emit(f"Removing partial video: {video_key_dir.name}/{partial_vid.name}")
+                    partial_vid.unlink()
+
+        self.log_message.emit("Loading existing dataset...")
+        dataset = LeRobotDataset(repo_id=self.dataset_name)
+        dataset.start_image_writer(num_processes=0, num_threads=16)
+        _patch_parallel_encoding(dataset)
+        _patch_jpeg_image_saving(dataset)
+        self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
+        return dataset
+
+    # -----------------------------------------------------------------
+    # Pipeline mode: filter → plan → convert
+    # -----------------------------------------------------------------
+
+    def _run_pipeline_conversion(self, LeRobotDataset, write_info):
+        """Full pipeline: run_filter_episodes → plan_episodes → accelerated convert."""
+
+        # ---------------------------------------------------------------
+        # Stage 1: Filter and synchronise episodes
+        # ---------------------------------------------------------------
+        filtered_dir = self.output_dir / "_filtered_cache"
+        max_time_diff_ms = self.fps
+
+        if filtered_dir.exists():
+            self.log_message.emit("Stage 1/3: Using cached filtered data (delete _filtered_cache to re-run)")
+        else:
+            self.log_message.emit(
+                f"Stage 1/3: Filtering & synchronising episodes "
+                f"(threshold={max_time_diff_ms:.1f}ms)..."
+            )
+            rc = run_filter_episodes(
+                source_dir=str(self.source_path),
+                out_dir=str(filtered_dir),
+                max_time_diff=max_time_diff_ms,
+                min_images=10,
+                dry_run=False,
+                overwrite=False,
+            )
+            if rc != 0:
+                self.finished_signal.emit(False, "Filtering stage failed. Check logs.")
+                return
+            self.log_message.emit("  Filtering complete.")
+
+        if self.cancelled:
+            self.finished_signal.emit(False, "Cancelled by user")
             return
-        
-        self.log_message.emit(f"Found {len(episodes)} episodes to convert")
-        
-        # Output path (will be created directly in the chosen location)
+
+        # ---------------------------------------------------------------
+        # Stage 2: Plan affordance-based episode slices
+        # ---------------------------------------------------------------
+        self.log_message.emit("Stage 2/3: Planning affordance slices...")
+        planned = plan_episodes(
+            self.annotations_dir,
+            self.source_path,             # raw data = cautery reference dir
+            Path("_unused"),              # out_dir placeholder (we don't copy)
+            source_dataset_dir=filtered_dir,
+        )
+        self.log_message.emit(f"  Planned {len(planned)} episodes")
+
+        if not planned:
+            self.finished_signal.emit(
+                False,
+                "No episodes planned. Check that annotations, cautery, and "
+                "filtered data paths are correct."
+            )
+            return
+
+        if self.cancelled:
+            self.finished_signal.emit(False, "Cancelled by user")
+            return
+
+        # ---------------------------------------------------------------
+        # Stage 3: Accelerated conversion to LeRobot
+        # ---------------------------------------------------------------
+        self.log_message.emit("Stage 3/3: Converting to LeRobot format...")
         output_path = self.output_dir / self.dataset_name
         self.log_message.emit(f"Output path: {output_path}")
-        
         if self.resume_mode:
-            # --- RESUME: clean up partial data, then load existing dataset ---
-            self.log_message.emit(f"Resuming: {self.skip_count} episodes already completed")
-            
-            # Delete stale intermediate images from killed-mid-episode process
-            # Check both the dataset dir (old runs) and the local temp dir (new runs)
-            for stale_dir in [output_path / "images",
-                              TEMP_IMAGE_DIR / "images" if TEMP_IMAGE_DIR else None]:
-                if stale_dir and stale_dir.exists():
-                    self.log_message.emit(f"Cleaning up stale intermediate images in {stale_dir}...")
-                    shutil.rmtree(stale_dir)
-            
-            # Delete any partial files for the first incomplete episode
-            partial_ep = f"episode_{self.skip_count:06d}"
-            for parquet in (output_path / "data").glob(f"chunk-*/{partial_ep}.parquet"):
-                self.log_message.emit(f"Removing partial parquet: {parquet.name}")
-                parquet.unlink()
-            videos_dir = output_path / "videos"
-            if videos_dir.exists():
-                for video_key_dir in videos_dir.iterdir():
-                    partial_vid = video_key_dir / f"{partial_ep}.mp4"
-                    if partial_vid.exists():
-                        self.log_message.emit(f"Removing partial video: {video_key_dir.name}/{partial_vid.name}")
-                        partial_vid.unlink()
-            
-            # Load existing dataset
-            self.log_message.emit("Loading existing dataset...")
-            dataset = LeRobotDataset(repo_id=self.dataset_name)
-            dataset.start_image_writer(num_processes=0, num_threads=16)
-            _patch_parallel_encoding(dataset)
-            _patch_jpeg_image_saving(dataset)
-            self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
+            dataset = self._init_resume_dataset(LeRobotDataset, output_path)
         else:
-            # --- FRESH: wipe and create new dataset ---
             if output_path.exists():
                 self.log_message.emit(f"Removing existing dataset at {output_path}")
                 shutil.rmtree(output_path)
-            
-            # Get image dimensions from first valid episode
+            # Get image shapes from first planned episode
+            first_src_session = planned[0][2]  # src_session_dir
+            img_shape_endo, img_shape_wrist = self._get_image_shapes([first_src_session])
+            self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
+            self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
+            self.log_message.emit("Creating LeRobot dataset...")
+            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
+
+        start_time = time.time()
+        successful_episodes = self.skip_count if self.resume_mode else 0
+        perfect_count = 0
+        recovery_count = 0
+        valid_seen = 0
+        episode_times = []  # Track per-episode durations for ETA
+
+        for i, (ann, ref, src, dst, start, end) in enumerate(planned):
+            if self.cancelled:
+                self.log_message.emit("Conversion cancelled by user")
+                self.finished_signal.emit(False, "Cancelled by user")
+                return
+
+            # Derive subtask text from destination path structure
+            # dst = out_dir / tissue_N / subtask_dir / episode_NNN
+            subtask_dir_name = dst.parent.name          # e.g. "1_grasp"
+            subtask_text = " ".join(subtask_dir_name.split("_")[1:])  # "grasp"
+            is_recovery = "recovery" in subtask_text.lower()
+            if is_recovery:
+                subtask_text = subtask_text.replace(" recovery", "").replace("recovery", "").strip()
+
+            self.progress.emit(i, len(planned))
+            self.episode_started.emit(f"{dst.parent.name}/{dst.name}")
+
+            # Skip already-converted episodes during resume
+            if self.resume_mode and valid_seen < self.skip_count:
+                valid_seen += 1
+                self.log_message.emit(f"⏭ Skipping (already converted): {dst.name}")
+                continue
+
+            try:
+                t_ep_start = time.time()
+                self._process_planned_episode(dataset, ref, src, start, end, subtask_text)
+                t_proc_elapsed = time.time() - t_ep_start
+                self.log_message.emit(
+                    f"    → Frame processing complete ({t_proc_elapsed:.1f}s). "
+                    f"Encoding videos ({VIDEO_CODEC}, parallel)..."
+                )
+                t_enc = time.time()
+                dataset.save_episode()
+                t_enc_elapsed = time.time() - t_enc
+                t_ep_total = time.time() - t_ep_start
+                successful_episodes += 1
+                episode_times.append(t_ep_total)
+                if is_recovery:
+                    recovery_count += 1
+                else:
+                    perfect_count += 1
+                self.log_message.emit(
+                    f"✓ {dst.parent.name}/{dst.name} saved — "
+                    f"processing: {t_proc_elapsed:.1f}s, encoding: {t_enc_elapsed:.1f}s, "
+                    f"total: {t_ep_total:.1f}s  [task: \"{subtask_text}\"]"
+                )
+
+                # Compute and emit ETA
+                elapsed = time.time() - start_time
+                completed_count = i + 1 - (self.skip_count if self.resume_mode else 0)
+                remaining_count = len(planned) - (i + 1)
+                if completed_count > 0 and remaining_count > 0:
+                    # Use recent episodes (last 5) for better estimate
+                    recent = episode_times[-5:]
+                    avg_time = sum(recent) / len(recent)
+                    eta_secs = avg_time * remaining_count
+                    elapsed_str = self._format_duration(elapsed)
+                    eta_str = self._format_duration(eta_secs)
+                    self.eta_update.emit(
+                        f"Elapsed: {elapsed_str}  |  ETA: ~{eta_str} remaining"
+                    )
+                elif remaining_count == 0:
+                    elapsed_str = self._format_duration(elapsed)
+                    self.eta_update.emit(f"Elapsed: {elapsed_str}  |  Done!")
+            except Exception as e:
+                import traceback
+                error_details = traceback.format_exc()
+                self.log_message.emit(f"✗ Error processing {dst.name}:")
+                self.log_message.emit(f"  {error_details}")
+                try:
+                    dataset.clear_episode_buffer()
+                except:
+                    pass
+
+        # Final progress
+        self.progress.emit(len(planned), len(planned))
+        elapsed_str = self._format_duration(time.time() - start_time)
+        self.eta_update.emit(f"Elapsed: {elapsed_str}  |  Complete")
+
+        # Write train/val/test + perfect/recovery splits
+        total_episodes = successful_episodes
+        if total_episodes > 0:
+            train_count = int(0.8 * total_episodes)
+            val_count = int(0.1 * total_episodes)
+            dataset.meta.info["splits"] = {
+                "train": f"0:{train_count}",
+                "val": f"{train_count}:{train_count + val_count}",
+                "test": f"{train_count + val_count}:{total_episodes}",
+                "perfect": f"0:{perfect_count}",
+                "recovery": f"{perfect_count}:{perfect_count + recovery_count}",
+            }
+            write_info(dataset.meta.info, dataset.root)
+            self.log_message.emit(
+                f"Split configuration saved — "
+                f"train: {train_count}, val: {val_count}, "
+                f"test: {total_episodes - train_count - val_count} | "
+                f"perfect: {perfect_count}, recovery: {recovery_count}"
+            )
+
+        # Clean up intermediate images
+        self.log_message.emit("Cleaning up intermediate images...")
+        self._cleanup_all_images(dataset)
+
+        elapsed = time.time() - start_time
+        self.log_message.emit(f"\n{'='*50}")
+        self.log_message.emit("Conversion complete!")
+        self.log_message.emit(f"Total episodes: {successful_episodes}/{len(planned)}")
+        self.log_message.emit(f"Time elapsed: {elapsed:.1f} seconds")
+        self.log_message.emit(f"Dataset saved to: {output_path}")
+
+        self.finished_signal.emit(
+            True,
+            f"Successfully converted {successful_episodes} episodes\nOutput: {output_path}"
+        )
+
+    # -----------------------------------------------------------------
+    # Legacy flat-directory mode (no annotations)
+    # -----------------------------------------------------------------
+
+    def _run_flat_conversion(self, LeRobotDataset, write_info):
+        """Original flat-directory conversion (source/episode_xxx/...)."""
+
+        # Find all episode directories
+        episodes = sorted([d for d in self.source_path.iterdir() if d.is_dir()],
+                         key=lambda x: x.name)
+
+        if not episodes:
+            self.finished_signal.emit(False, "No episode directories found in source path")
+            return
+
+        self.log_message.emit(f"Found {len(episodes)} episodes to convert")
+
+        output_path = self.output_dir / self.dataset_name
+        self.log_message.emit(f"Output path: {output_path}")
+
+        if self.resume_mode:
+            dataset = self._init_resume_dataset(LeRobotDataset, output_path)
+        else:
+            if output_path.exists():
+                self.log_message.emit(f"Removing existing dataset at {output_path}")
+                shutil.rmtree(output_path)
             img_shape_endo, img_shape_wrist = self._get_image_shapes(episodes)
             self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
             self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
-            
-            # Initialize LeRobot dataset
             self.log_message.emit("Creating LeRobot dataset...")
-            dataset = LeRobotDataset.create(
-                repo_id=self.dataset_name,
-                use_videos=True,
-                robot_type="dvrk",
-                fps=self.fps,
-                features={
-                    "observation.images.endoscope.left": {
-                        "dtype": "video",
-                        "shape": img_shape_endo,
-                        "names": ["height", "width", "channel"],
-                    },
-                    "observation.images.endoscope.right": {
-                        "dtype": "video",
-                        "shape": img_shape_endo,
-                        "names": ["height", "width", "channel"],
-                    },
-                    "observation.images.wrist.left": {
-                        "dtype": "video",
-                        "shape": img_shape_wrist,
-                        "names": ["height", "width", "channel"],
-                    },
-                    "observation.images.wrist.right": {
-                        "dtype": "video",
-                        "shape": img_shape_wrist,
-                        "names": ["height", "width", "channel"],
-                    },
-                    "observation.state": {
-                        "dtype": "float32",
-                        "shape": (len(STATES_NAME),),
-                        "names": [STATES_NAME],
-                    },
-                    "action": {
-                        "dtype": "float32",
-                        "shape": (len(ACTIONS_NAME),),
-                        "names": [ACTIONS_NAME],
-                    },
-                    "observation.meta.tool.psm1": {
-                        "dtype": "string",
-                        "shape": (1,),
-                        "names": ["value"],
-                    },
-                    "observation.meta.tool.psm2": {
-                        "dtype": "string",
-                        "shape": (1,),
-                        "names": ["value"],
-                    },
-                    "instruction.text": {
-                        "dtype": "string",
-                        "shape": (1,),
-                        "description": "Natural language command for the robot",
-                    },
-                },
-                image_writer_processes=0,
-                image_writer_threads=16,
-                tolerance_s=0.1,
-                batch_encoding_size=1,  # Encode after each episode for crash resilience
-            )
-            _patch_parallel_encoding(dataset)
-            _patch_jpeg_image_saving(dataset)
-            self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
-        
+            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
+
         # Process each episode
         start_time = time.time()
         successful_episodes = self.skip_count if self.resume_mode else 0
         valid_seen = 0
-        
+
+        # Derive a default task text from the source directory name
+        default_task_text = self.source_path.name.replace("_", " ")
+
         for i, episode_path in enumerate(episodes):
             if self.cancelled:
                 self.log_message.emit("Conversion cancelled by user")
                 self.finished_signal.emit(False, "Cancelled by user")
                 return
-            
+
             self.progress.emit(i, len(episodes))
             self.episode_started.emit(episode_path.name)
-            
+
             # Validate episode
             is_valid, error_msg = validate_episode(episode_path)
             if not is_valid:
                 self.log_message.emit(f"⚠ Skipping invalid episode {episode_path.name}: {error_msg}")
                 continue
-            
+
             # Skip already-converted episodes during resume
             if self.resume_mode and valid_seen < self.skip_count:
                 valid_seen += 1
                 self.log_message.emit(f"⏭ Skipping (already converted): {episode_path.name}")
                 continue
-            
+
             try:
                 t_ep_start = time.time()
-                self._process_episode(dataset, episode_path)
+                self._process_episode(dataset, episode_path, default_task_text)
                 t_proc_elapsed = time.time() - t_ep_start
                 self.log_message.emit(
                     f"    → Frame processing complete ({t_proc_elapsed:.1f}s). "
@@ -632,14 +876,11 @@ class ConversionWorker(QThread):
                     dataset.clear_episode_buffer()
                 except:
                     pass  # Ignore cleanup errors
-        
+
         # Final progress update
         self.progress.emit(len(episodes), len(episodes))
-        
-        # Note: Video encoding happens automatically via batch_encoding_size=1
-        # Each episode is encoded to MP4 right after save_episode() is called
-        
-        # Write splits - all episodes go to train, val and test are empty
+
+        # Write splits
         total_episodes = successful_episodes
         if total_episodes > 0:
             dataset.meta.info["splits"] = {
@@ -649,18 +890,18 @@ class ConversionWorker(QThread):
             }
             write_info(dataset.meta.info, dataset.root)
             self.log_message.emit(f"Split configuration saved (train: {total_episodes}, val: 0, test: 0)")
-        
+
         # Clean up ALL intermediate images at the end
         self.log_message.emit("Cleaning up intermediate images...")
         self._cleanup_all_images(dataset)
-        
+
         elapsed = time.time() - start_time
         self.log_message.emit(f"\n{'='*50}")
         self.log_message.emit(f"Conversion complete!")
         self.log_message.emit(f"Total episodes: {successful_episodes}/{len(episodes)}")
         self.log_message.emit(f"Time elapsed: {elapsed:.1f} seconds")
         self.log_message.emit(f"Dataset saved to: {output_path}")
-        
+
         self.finished_signal.emit(True, f"Successfully converted {successful_episodes} episodes\nOutput: {output_path}")
     
     def _get_image_shapes(self, episodes: List[Path]) -> Tuple[Tuple, Tuple]:
@@ -697,7 +938,169 @@ class ConversionWorker(QThread):
             raise ValueError(f"Failed to read image: {path}")
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    def _process_episode(self, dataset, episode_path: Path):
+    def _process_planned_episode(self, dataset, ref_session_dir: Path,
+                                   src_session_dir: Path, start_idx: int,
+                                   end_idx: int, subtask_text: str):
+        """Process a single affordance-sliced episode from pre-filtered data.
+
+        Reads frames directly from the *filtered session* directory,
+        using timestamp alignment to map reference (cautery) frame indices
+        to source (filtered) frame indices.
+
+        Since the filtered data is already multi-camera synced by
+        ``run_filter_episodes``, we only need to locate the affordance
+        slice window — no additional sync step is needed.
+        """
+        t_start = time.time()
+
+        # ------------------------------------------------------------------
+        # 1. Timestamp alignment: reference indices → source indices
+        # ------------------------------------------------------------------
+        ref_left_dir = ref_session_dir / LEFT_IMG_DIR
+        ref_files = list_sorted_frames(ref_left_dir, "_left.jpg")
+        if not ref_files:
+            raise ValueError(f"Reference directory empty: {ref_left_dir}")
+
+        s_clamped = max(0, min(start_idx, len(ref_files) - 1))
+        e_clamped = max(0, min(end_idx, len(ref_files) - 1))
+        ts_start = sa_extract_timestamp(ref_files[s_clamped])
+        ts_end   = sa_extract_timestamp(ref_files[e_clamped])
+
+        src_left_dir = src_session_dir / LEFT_IMG_DIR
+        src_files = list_sorted_frames(src_left_dir, "_left.jpg")
+        if not src_files:
+            raise ValueError(f"Source directory empty: {src_left_dir}")
+
+        src_timestamps = np.array(
+            [sa_extract_timestamp(f) for f in src_files], dtype=np.int64
+        )
+        new_start = int(np.searchsorted(src_timestamps, ts_start, side="left"))
+        new_end   = int(np.searchsorted(src_timestamps, ts_end,   side="right")) - 1
+        new_start = max(0, min(new_start, len(src_files) - 1))
+        new_end   = max(0, min(new_end,   len(src_files) - 1))
+
+        total_frames = new_end - new_start + 1
+        if total_frames <= 0:
+            raise ValueError(
+                f"Empty slice after alignment: ref {start_idx}-{end_idx} "
+                f"→ src {new_start}-{new_end}"
+            )
+
+        self.log_message.emit(
+            f"  Aligned ref[{start_idx}:{end_idx}] → src[{new_start}:{new_end}] "
+            f"({total_frames} frames)"
+        )
+        t_align = time.time()
+
+        # ------------------------------------------------------------------
+        # 2. Build path lists for ALL cameras in the filtered session
+        # ------------------------------------------------------------------
+        left_paths = [src_left_dir / f for f in src_files]
+
+        right_files = list_sorted_frames(src_session_dir / RIGHT_IMG_DIR, "_right.jpg")
+        right_paths = (
+            [src_session_dir / RIGHT_IMG_DIR / f for f in right_files]
+            if right_files else None
+        )
+
+        psm1_files = list_sorted_frames(src_session_dir / ENDO_PSM1_DIR, "_psm1.jpg")
+        psm1_paths = (
+            [src_session_dir / ENDO_PSM1_DIR / f for f in psm1_files]
+            if psm1_files else None
+        )
+
+        psm2_files = list_sorted_frames(src_session_dir / ENDO_PSM2_DIR, "_psm2.jpg")
+        psm2_paths = (
+            [src_session_dir / ENDO_PSM2_DIR / f for f in psm2_files]
+            if psm2_files else None
+        )
+
+        # ------------------------------------------------------------------
+        # 3. Load CSV & pre-compute state/action matrices (sliced)
+        # ------------------------------------------------------------------
+        # CSV lives in the original raw data dir, not in the filtered cache
+        csv_path = ref_session_dir / CSV_FILE
+        df = pd.read_csv(csv_path)
+        state_cols  = [c for c in STATES_NAME  if c in df.columns]
+        action_cols = [c for c in ACTIONS_NAME if c in df.columns]
+        states_matrix  = df[state_cols].values.astype(np.float32)
+        actions_matrix = df[action_cols].values.astype(np.float32)
+
+        t_prep = time.time()
+        self.log_message.emit(
+            f"  Processing {total_frames} frames "
+            f"(align: {t_align - t_start:.1f}s, prep: {t_prep - t_align:.1f}s)..."
+        )
+
+        # ------------------------------------------------------------------
+        # 4. Pipelined frame processing
+        # ------------------------------------------------------------------
+        PIPELINE_DEPTH = 64
+        NUM_WORKERS = 16
+        fps_inv = 1.0 / self.fps
+        t_add_total = 0.0
+
+        def _build_frame(out_idx):
+            """Build frame dict for output index *out_idx* (0-based)."""
+            src_idx = new_start + out_idx
+            left_img = self._load_image_cv2(left_paths[src_idx])
+            frame = {
+                "observation.state": states_matrix[src_idx],
+                "action":            actions_matrix[src_idx],
+                "instruction.text":  subtask_text,
+                "observation.meta.tool.psm1": self.psm1_tool,
+                "observation.meta.tool.psm2": self.psm2_tool,
+                "observation.images.endoscope.left": left_img,
+            }
+            if right_paths and src_idx < len(right_paths):
+                frame["observation.images.endoscope.right"] = self._load_image_cv2(
+                    right_paths[src_idx]
+                )
+            if psm1_paths and src_idx < len(psm1_paths):
+                frame["observation.images.wrist.right"] = self._load_image_cv2(
+                    psm1_paths[src_idx]
+                )
+            if psm2_paths and src_idx < len(psm2_paths):
+                frame["observation.images.wrist.left"] = self._load_image_cv2(
+                    psm2_paths[src_idx]
+                )
+            return frame
+
+        pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+        futures = {}
+        for i in range(min(PIPELINE_DEPTH, total_frames)):
+            futures[i] = pool.submit(_build_frame, i)
+
+        for frame_idx in range(total_frames):
+            if frame_idx > 0 and frame_idx % 500 == 0:
+                avg_add = (t_add_total / frame_idx) * 1000
+                self.log_message.emit(
+                    f"    -> {frame_idx}/{total_frames} "
+                    f"(avg add_frame={avg_add:.1f}ms)"
+                )
+
+            frame = futures.pop(frame_idx).result()
+            next_idx = frame_idx + PIPELINE_DEPTH
+            if next_idx < total_frames:
+                futures[next_idx] = pool.submit(_build_frame, next_idx)
+
+            t0 = time.time()
+            dataset.add_frame(frame, task=subtask_text, timestamp=frame_idx * fps_inv)
+            t_add_total += time.time() - t0
+
+        pool.shutdown(wait=False)
+
+        t_end = time.time()
+        self.log_message.emit(
+            f"    -> {total_frames}/{total_frames} frames (100%) "
+            f"| total: {t_end - t_start:.1f}s "
+            f"(align: {t_align - t_start:.1f}s, "
+            f"prep: {t_prep - t_align:.1f}s, "
+            f"add_frame: {t_add_total:.1f}s, "
+            f"pipeline overhead: {(t_end - t_prep) - t_add_total:.1f}s)"
+        )
+
+    def _process_episode(self, dataset, episode_path: Path, task_text: str = "default_task"):
         """Process a single episode with strict timestamp-based synchronization.
 
         Delegates sync + filtering to ``run_filter_episode()`` which handles:
@@ -809,7 +1212,7 @@ class ConversionWorker(QThread):
             frame = {
                 "observation.state": states_matrix[csv_idx],
                 "action": actions_matrix[csv_idx],
-                "instruction.text": self.task_text,
+                "instruction.text": task_text,
                 "observation.meta.tool.psm1": self.psm1_tool,
                 "observation.meta.tool.psm2": self.psm2_tool,
                 "observation.images.endoscope.left": left_img,
@@ -852,7 +1255,7 @@ class ConversionWorker(QThread):
                 futures[next_idx] = pool.submit(_build_frame, next_idx)
 
             t0 = time.time()
-            dataset.add_frame(frame, task=self.task_text, timestamp=frame_idx * fps_inv)
+            dataset.add_frame(frame, task=task_text, timestamp=frame_idx * fps_inv)
             t_add_total += time.time() - t0
 
         pool.shutdown(wait=False)
@@ -888,9 +1291,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DVRK to LeRobot Converter")
-        self.setGeometry(100, 100, 900, 700)
+        self.setGeometry(100, 100, 900, 750)
         
         self.source_path: Optional[Path] = None
+        self.annotations_path: Optional[Path] = None
         self.output_dir: Path = Path(DEFAULT_LEROBOT_HOME)
         self.worker: Optional[ConversionWorker] = None
         
@@ -908,20 +1312,36 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("color: #2c3e50; margin: 10px;")
         main_layout.addWidget(title)
         
-        # Source Directory Selection
-        source_group = QGroupBox("Source Data")
-        source_layout = QHBoxLayout(source_group)
-        
-        source_layout.addWidget(QLabel("Data Directory:"))
+        # Source & Pipeline Directory Selection
+        source_group = QGroupBox("Pipeline Directories")
+        source_vlayout = QVBoxLayout(source_group)
+
+        # Raw data directory
+        raw_layout = QHBoxLayout()
+        raw_layout.addWidget(QLabel("Raw Data Directory:"))
         self.source_label = QLabel("No directory selected")
         self.source_label.setStyleSheet("color: #888; font-style: italic;")
-        source_layout.addWidget(self.source_label, stretch=1)
-        
+        raw_layout.addWidget(self.source_label, stretch=1)
         self.select_source_btn = QPushButton("Browse...")
         self.select_source_btn.clicked.connect(self._select_source_directory)
         self.select_source_btn.setStyleSheet("background-color: #3498db; color: white;")
-        source_layout.addWidget(self.select_source_btn)
-        
+        raw_layout.addWidget(self.select_source_btn)
+        source_vlayout.addLayout(raw_layout)
+
+        # Annotations directory (post_process)
+        ann_layout = QHBoxLayout()
+        ann_layout.addWidget(QLabel("Annotations Dir:"))
+        self.annotations_label = QLabel("(optional — enables pipeline mode)")
+        self.annotations_label.setStyleSheet("color: #888; font-style: italic;")
+        ann_layout.addWidget(self.annotations_label, stretch=1)
+        self.select_annotations_btn = QPushButton("Browse...")
+        self.select_annotations_btn.clicked.connect(self._select_annotations_directory)
+        self.select_annotations_btn.setStyleSheet("background-color: #3498db; color: white;")
+        ann_layout.addWidget(self.select_annotations_btn)
+        source_vlayout.addLayout(ann_layout)
+
+
+
         main_layout.addWidget(source_group)
         
         # Destination/Repo Settings
@@ -943,7 +1363,7 @@ class MainWindow(QMainWindow):
         
         # Dataset name
         name_layout = QFormLayout()
-        self.dataset_name_edit = QLineEdit("dvrk_wound_closure")
+        self.dataset_name_edit = QLineEdit("Cholecystectomy")
         self.dataset_name_edit.setPlaceholderText("dataset-name")
         name_layout.addRow("Dataset Name:", self.dataset_name_edit)
         dest_layout.addLayout(name_layout)
@@ -963,14 +1383,10 @@ class MainWindow(QMainWindow):
         meta_group = QGroupBox("Metadata")
         meta_layout = QFormLayout(meta_group)
         
-        self.task_edit = QLineEdit("Wound Closure")
-        self.task_edit.setPlaceholderText("Task description")
-        meta_layout.addRow("Task Text:", self.task_edit)
-        
-        self.psm1_tool_edit = QLineEdit("Mega SutureCut Needle Driver")
+        self.psm1_tool_edit = QLineEdit("Permanent Cautery Hook")
         meta_layout.addRow("PSM1 Tool:", self.psm1_tool_edit)
         
-        self.psm2_tool_edit = QLineEdit("Large Needle Driver")
+        self.psm2_tool_edit = QLineEdit("Prograsp Forceps")
         meta_layout.addRow("PSM2 Tool:", self.psm2_tool_edit)
         
         self.fps_spinbox = QSpinBox()
@@ -997,6 +1413,12 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setFormat("%v / %m episodes")
         progress_layout.addWidget(self.progress_bar)
+        
+        self.eta_label = QLabel("")
+        self.eta_label.setStyleSheet(
+            "color: #555; font-size: 11px; font-style: italic;"
+        )
+        progress_layout.addWidget(self.eta_label)
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -1032,6 +1454,20 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         btn_layout.addWidget(self.cancel_btn)
         
+        self.clear_cache_btn = QPushButton("Clear Cache")
+        self.clear_cache_btn.clicked.connect(self._clear_cache)
+        self.clear_cache_btn.setStyleSheet("""
+            background-color: #f39c12;
+            color: white;
+            padding: 10px 20px;
+            font-size: 14px;
+        """)
+        self.clear_cache_btn.setToolTip(
+            "Delete the filtered data cache. Use this if the cache is "
+            "corrupted or was created with incorrect settings."
+        )
+        btn_layout.addWidget(self.clear_cache_btn)
+        
         main_layout.addLayout(btn_layout)
     
     def _log(self, message: str):
@@ -1064,6 +1500,22 @@ class MainWindow(QMainWindow):
         self._log(f"Found {len(episodes)} episode directories")
         
         self.start_btn.setEnabled(len(episodes) > 0)
+
+    def _select_annotations_directory(self):
+        """Allow user to select the annotations (post_process) directory."""
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Annotations Directory (post_process)",
+            str(self.annotations_path) if self.annotations_path else "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        if not selected_dir:
+            return
+        self.annotations_path = Path(selected_dir)
+        self.annotations_label.setText(str(self.annotations_path))
+        self.annotations_label.setStyleSheet("color: black;")
+        self._log(f"Annotations dir: {self.annotations_path}")
+
     
     def _select_output_directory(self):
         """Allow user to select the output directory"""
@@ -1166,14 +1618,16 @@ class MainWindow(QMainWindow):
         # Disable UI during conversion
         self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        self.clear_cache_btn.setEnabled(False)
         self.select_source_btn.setEnabled(False)
+        self.select_annotations_btn.setEnabled(False)
         self.select_output_btn.setEnabled(False)
         self.dataset_name_edit.setEnabled(False)
-        self.task_edit.setEnabled(False)
         self.psm1_tool_edit.setEnabled(False)
         self.psm2_tool_edit.setEnabled(False)
         self.fps_spinbox.setEnabled(False)
         self.codec_combo.setEnabled(False)
+        self.eta_label.setText("")
         
         self.log_text.clear()
         if resume_mode:
@@ -1186,10 +1640,10 @@ class MainWindow(QMainWindow):
             source_path=self.source_path,
             output_dir=self.output_dir,
             dataset_name=dataset_name,
-            task_text=self.task_edit.text().strip(),
             psm1_tool=self.psm1_tool_edit.text().strip(),
             psm2_tool=self.psm2_tool_edit.text().strip(),
             fps=self.fps_spinbox.value(),
+            annotations_dir=self.annotations_path,
             resume_mode=resume_mode,
             skip_count=skip_count,
         )
@@ -1197,6 +1651,7 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(self._on_progress)
         self.worker.log_message.connect(self._log)
         self.worker.episode_started.connect(self._on_episode_started)
+        self.worker.eta_update.connect(self._on_eta_update)
         self.worker.finished_signal.connect(self._on_finished)
         
         self.worker.start()
@@ -1216,15 +1671,63 @@ class MainWindow(QMainWindow):
         """Update episode label"""
         self.episode_label.setText(f"Episode: {episode_name}")
     
+    def _on_eta_update(self, eta_text: str):
+        """Update the ETA label."""
+        self.eta_label.setText(eta_text)
+
+    def _clear_cache(self):
+        """Delete the _filtered_cache directory after user confirmation."""
+        cache_dir = self.output_dir / "_filtered_cache"
+
+        if not cache_dir.exists():
+            QMessageBox.information(
+                self, "No Cache",
+                "No filtered data cache found.\n\n"
+                f"Expected location:\n{cache_dir}"
+            )
+            return
+
+        reply = QMessageBox.warning(
+            self,
+            "Clear Filtered Data Cache?",
+            "This will delete the cached filtered data. The next conversion "
+            "will re-run the filtering stage (Stage 1), which takes longer.\n\n"
+            "Use this if:\n"
+            "  • The cache was created with incorrect settings\n"
+            "  • Data appears corrupted or misaligned\n"
+            "  • You changed the source data since the last run\n\n"
+            f"Cache location:\n{cache_dir}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply == QMessageBox.Yes:
+            import shutil
+            try:
+                shutil.rmtree(cache_dir)
+                self._log(f"✓ Cleared filtered data cache: {cache_dir}")
+                QMessageBox.information(
+                    self, "Cache Cleared",
+                    "Filtered data cache deleted successfully.\n"
+                    "Stage 1 will re-run on the next conversion."
+                )
+            except Exception as e:
+                self._log(f"✗ Failed to clear cache: {e}")
+                QMessageBox.critical(
+                    self, "Error",
+                    f"Failed to delete cache:\n{e}"
+                )
+
     def _on_finished(self, success: bool, message: str):
         """Handle conversion completion"""
         # Re-enable UI
         self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self.clear_cache_btn.setEnabled(True)
         self.select_source_btn.setEnabled(True)
+        self.select_annotations_btn.setEnabled(True)
         self.select_output_btn.setEnabled(True)
         self.dataset_name_edit.setEnabled(True)
-        self.task_edit.setEnabled(True)
         self.psm1_tool_edit.setEnabled(True)
         self.psm2_tool_edit.setEnabled(True)
         self.fps_spinbox.setEnabled(True)

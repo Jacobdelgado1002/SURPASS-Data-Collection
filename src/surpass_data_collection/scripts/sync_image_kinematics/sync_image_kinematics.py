@@ -296,6 +296,9 @@ def load_kinematics_data(csv_file: Union[str, Path]) -> pd.DataFrame:
         df["timestamp_ns"] = start_time + np.arange(len(df)) * freq_ns
         logger.info(f"Generated {len(df)} synthetic timestamps")
 
+    # Defragment after column addition (avoids PerformanceWarning on wide CSVs)
+    df = df.copy()
+
     return df
 
 
