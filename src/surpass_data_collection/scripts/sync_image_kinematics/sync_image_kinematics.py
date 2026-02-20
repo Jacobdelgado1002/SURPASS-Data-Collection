@@ -280,6 +280,9 @@ def load_kinematics_data(csv_file: Union[str, Path]) -> pd.DataFrame:
         for col in df.columns
         if "time" in col.lower() or "stamp" in col.lower()
     ]
+    
+    # Defragment after column addition (avoids PerformanceWarning on wide CSVs)
+    df = df.copy()
 
     if timestamp_cols:
         # Use the first timestamp column found
@@ -295,9 +298,6 @@ def load_kinematics_data(csv_file: Union[str, Path]) -> pd.DataFrame:
         freq_ns: int = int(1e9 / SYNTHETIC_TIMESTAMP_FREQ_HZ)  # 30 Hz in nanoseconds
         df["timestamp_ns"] = start_time + np.arange(len(df)) * freq_ns
         logger.info(f"Generated {len(df)} synthetic timestamps")
-
-    # Defragment after column addition (avoids PerformanceWarning on wide CSVs)
-    df = df.copy()
 
     return df
 
