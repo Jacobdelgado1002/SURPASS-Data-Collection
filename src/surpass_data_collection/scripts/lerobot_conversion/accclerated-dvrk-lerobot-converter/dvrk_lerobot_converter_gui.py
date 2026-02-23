@@ -405,6 +405,9 @@ def _patch_jpeg_image_saving(dataset):
 
         def _write_image_fast(image, fpath: Path):
             fpath = Path(fpath)
+            # If the file was pre-placed (hardlink from source), skip writing
+            if fpath.exists():
+                return
             if fpath.suffix.lower() in (".jpg", ".jpeg"):
                 if isinstance(image, np.ndarray):
                     if image.ndim == 3 and image.shape[0] == 3:
@@ -612,6 +615,7 @@ class ConversionWorker(QThread):
                 min_images=10,
                 dry_run=False,
                 overwrite=False,
+                use_hardlink=True,
             )
             if rc != 0:
                 self.finished_signal.emit(False, "Filtering stage failed. Check logs.")
@@ -1033,44 +1037,74 @@ class ConversionWorker(QThread):
         )
 
         # ------------------------------------------------------------------
-        # 4. Pipelined frame processing
+        # 4. Pre-place source JPEGs & build frames with dummy images
+        #    (Eliminates JPEG decode → re-encode → re-decode round-trip)
         # ------------------------------------------------------------------
-        PIPELINE_DEPTH = 64
-        NUM_WORKERS = 16
+        from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
+
         fps_inv = 1.0 / self.fps
         t_add_total = 0.0
 
-        def _build_frame(out_idx):
-            """Build frame dict for output index *out_idx* (0-based)."""
-            src_idx = new_start + out_idx
-            left_img = self._load_image_cv2(left_paths[src_idx])
-            frame = {
-                "observation.state": states_matrix[src_idx],
-                "action":            actions_matrix[src_idx],
-                "instruction.text":  subtask_text,
-                "observation.meta.tool.psm1": self.psm1_tool,
-                "observation.meta.tool.psm2": self.psm2_tool,
-                "observation.images.endoscope.left": left_img,
-            }
-            if right_paths and src_idx < len(right_paths):
-                frame["observation.images.endoscope.right"] = self._load_image_cv2(
-                    right_paths[src_idx]
-                )
-            if psm1_paths and src_idx < len(psm1_paths):
-                frame["observation.images.wrist.right"] = self._load_image_cv2(
-                    psm1_paths[src_idx]
-                )
-            if psm2_paths and src_idx < len(psm2_paths):
-                frame["observation.images.wrist.left"] = self._load_image_cv2(
-                    psm2_paths[src_idx]
-                )
-            return frame
+        # Determine the episode_index LeRobot will use for file paths
+        ep_idx_for_paths = dataset.episode_buffer["episode_index"]
+        _temp_base = TEMP_IMAGE_DIR if TEMP_IMAGE_DIR is not None else dataset.root
 
-        pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
-        futures = {}
-        for i in range(min(PIPELINE_DEPTH, total_frames)):
-            futures[i] = pool.submit(_build_frame, i)
+        # Map image keys to their source path lists
+        camera_path_map = {
+            "observation.images.endoscope.left":  left_paths,
+            "observation.images.endoscope.right": right_paths,
+            "observation.images.wrist.right":     psm1_paths,
+            "observation.images.wrist.left":      psm2_paths,
+        }
 
+        # Get image shapes from dataset features for dummy arrays
+        _dummy_cache = {}  # image_key -> dummy numpy array
+        for img_key in camera_path_map:
+            feat = dataset.features[img_key]
+            shape = tuple(feat["shape"])  # (c, h, w) or (h, w, c)
+            _dummy_cache[img_key] = np.zeros(shape, dtype=np.uint8)
+
+        # Pre-place source JPEGs as hardlinks at the paths LeRobot expects.
+        # This lets ffmpeg read the original files directly during encoding,
+        # completely skipping the decode→numpy→encode→write cycle.
+        t_preplace_start = time.time()
+        preplace_count = 0
+        preplace_fallback_count = 0
+        import shutil as _shutil
+
+        for img_key, paths in camera_path_map.items():
+            if not paths:
+                continue
+            for out_idx in range(total_frames):
+                src_idx = new_start + out_idx
+                if src_idx >= len(paths):
+                    continue
+                source_jpg = paths[src_idx]
+                target_rel = DEFAULT_IMAGE_PATH.format(
+                    image_key=img_key,
+                    episode_index=ep_idx_for_paths,
+                    frame_index=out_idx,
+                )
+                target = (_temp_base / target_rel).with_suffix(".jpg")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    try:
+                        os.link(str(source_jpg), str(target))
+                    except (OSError, NotImplementedError):
+                        _shutil.copy2(str(source_jpg), str(target))
+                        preplace_fallback_count += 1
+                    preplace_count += 1
+
+        t_preplace = time.time()
+        self.log_message.emit(
+            f"  Pre-placed {preplace_count} source JPEGs as hardlinks "
+            f"({t_preplace - t_preplace_start:.1f}s)"
+            + (f" ({preplace_fallback_count} fell back to copy)" if preplace_fallback_count else "")
+        )
+
+        # Build and add frames using lightweight dummy image arrays.
+        # The dummy arrays pass LeRobot's shape validation, and _write_image_fast
+        # skips writing because the file already exists on disk.
         for frame_idx in range(total_frames):
             if frame_idx > 0 and frame_idx % 500 == 0:
                 avg_add = (t_add_total / frame_idx) * 1000
@@ -1079,16 +1113,22 @@ class ConversionWorker(QThread):
                     f"(avg add_frame={avg_add:.1f}ms)"
                 )
 
-            frame = futures.pop(frame_idx).result()
-            next_idx = frame_idx + PIPELINE_DEPTH
-            if next_idx < total_frames:
-                futures[next_idx] = pool.submit(_build_frame, next_idx)
+            src_idx = new_start + frame_idx
+            frame = {
+                "observation.state": states_matrix[src_idx],
+                "action":            actions_matrix[src_idx],
+                "instruction.text":  subtask_text,
+                "observation.meta.tool.psm1": self.psm1_tool,
+                "observation.meta.tool.psm2": self.psm2_tool,
+            }
+            # Add dummy images for each available camera
+            for img_key, paths in camera_path_map.items():
+                if paths and src_idx < len(paths):
+                    frame[img_key] = _dummy_cache[img_key]
 
             t0 = time.time()
             dataset.add_frame(frame, task=subtask_text, timestamp=frame_idx * fps_inv)
             t_add_total += time.time() - t0
-
-        pool.shutdown(wait=False)
 
         t_end = time.time()
         self.log_message.emit(
@@ -1096,8 +1136,8 @@ class ConversionWorker(QThread):
             f"| total: {t_end - t_start:.1f}s "
             f"(align: {t_align - t_start:.1f}s, "
             f"prep: {t_prep - t_align:.1f}s, "
-            f"add_frame: {t_add_total:.1f}s, "
-            f"pipeline overhead: {(t_end - t_prep) - t_add_total:.1f}s)"
+            f"pre-place: {t_preplace - t_preplace_start:.1f}s, "
+            f"add_frame: {t_add_total:.1f}s)"
         )
 
     def _process_episode(self, dataset, episode_path: Path, task_text: str = "default_task"):
