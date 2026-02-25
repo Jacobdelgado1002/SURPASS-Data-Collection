@@ -1,0 +1,22 @@
+# DVRK to LeRobot Converter - Python Dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Requires Python 3.10+
+
+# GUI
+PyQt5
+
+# Data processing
+numpy
+pandas
+opencv-python
+Pillow
+
+# Video encoding/decoding
+av
+
+# LeRobot dataset library (the core conversion target)
+# Install from GitHub for the latest v2.1 support:
+#   pip install git+https://github.com/huggingface/lerobot.git
+# Or from PyPI (if available):
+lerobot

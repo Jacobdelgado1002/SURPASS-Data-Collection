@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-GUI-based converter for DVRK data to LeRobot v2.1 format.
+GUI-based converter for DVRK data to LeRobot v3.0 format.
 
 This tool provides a graphical interface to convert DVRK surgical robot datasets
 into LeRobot format with timestamp-based alignment across multiple camera views.
