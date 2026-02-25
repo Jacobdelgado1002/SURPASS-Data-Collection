@@ -1,8 +1,26 @@
-opencv-python
+# DVRK to LeRobot Converter - Python Dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Requires Python 3.10+
+
+# GUI
+PyQt5
+
+# Data processing
 numpy
-matplotlib
 pandas
+opencv-python
+Pillow
+matplotlib
 tyro
+lerobot
+huggingface-hub
 PIL
-lerobot==0.3.3 # Not needed for data collection. Uncomment if you want to convert to lerobot format.
-huggingface-hub==0.34.4 # Not needed for data collection. Uncomment if you want to convert to lerobot format.
+
+# Video encoding/decoding
+av
+
+
+# Uncomment for lerobot v2.1 conversion
+# lerobot==0.3.3
+# huggingface-hub==0.34.4

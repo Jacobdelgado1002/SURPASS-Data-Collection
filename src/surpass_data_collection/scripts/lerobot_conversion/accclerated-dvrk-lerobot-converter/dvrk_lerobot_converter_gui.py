@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-GUI-based converter for DVRK data to LeRobot v2.1 format.
+GUI-based converter for DVRK data to LeRobot v3.0 format.
 
 This tool provides a graphical interface to convert DVRK surgical robot datasets
 into LeRobot format with timestamp-based alignment across multiple camera views.
@@ -69,15 +69,17 @@ DEFAULT_LEROBOT_HOME = os.path.join(os.path.expanduser("~"), ".cache", "huggingf
 # Available video codecs (selectable in the GUI):
 CODEC_OPTIONS = {
     "h264 (CPU — works everywhere)":       "h264",
-    "h264_nvenc (NVIDIA GPU — fastest)":    "h264_nvenc",
-    "h264_amf (AMD GPU)":                   "h264_amf",
-    "h264_qsv (Intel Quick Sync)":          "h264_qsv",
+    "hevc (CPU — works everywhere)":       "hevc",
+    # "h264_nvenc (NVIDIA GPU — fastest)":    "h264_nvenc",
+    # "h264_amf (AMD GPU)":                   "h264_amf",
+    # "h264_qsv (Intel Quick Sync)":          "h264_qsv",
     "libsvtav1 (CPU — best compression, VERY SLOW)": "libsvtav1",
 }
-DEFAULT_CODEC_LABEL = "h264_nvenc (NVIDIA GPU — fastest)"
+# DEFAULT_CODEC_LABEL = "h264_nvenc (NVIDIA GPU — fastest)"
+DEFAULT_CODEC_LABEL = "h264 (CPU — works everywhere)"
 
 # This global is updated from the GUI before conversion starts
-VIDEO_CODEC = "h264_nvenc"
+VIDEO_CODEC = "h264"
 
 # Intermediate image directory — use a FAST LOCAL drive (NVMe/SSD) to avoid
 # bottlenecking encoding on the (possibly slower) dataset output drive.
@@ -245,13 +247,13 @@ def _encode_video_frames_custom(
     # Discover intermediate frames — JPEG first, fall back to PNG (legacy)
     digits = "[0-9]" * 6
     input_list = sorted(
-        glob_module.glob(str(imgs_dir / f"frame_{digits}.jpg")),
-        key=lambda x: int(x.split("_")[-1].split(".")[0]),
+        glob_module.glob(str(imgs_dir / f"frame-{digits}.jpg")),
+        key=lambda x: int(Path(x).stem.split("-")[-1]),
     )
     if not input_list:
         input_list = sorted(
-            glob_module.glob(str(imgs_dir / f"frame_{digits}.png")),
-            key=lambda x: int(x.split("_")[-1].split(".")[0]),
+            glob_module.glob(str(imgs_dir / f"frame-{digits}.png")),
+            key=lambda x: int(Path(x).stem.split("-")[-1]),
         )
     if not input_list:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
@@ -313,47 +315,74 @@ def _encode_video_frames_custom(
             output.mux(packet)
 
 
-def _parallel_encode_episode_videos(self, episode_index: int) -> None:
-    """Drop-in replacement for LeRobotDataset.encode_episode_videos.
-
-    * Encodes all video streams in parallel (ThreadPoolExecutor).
-    * Uses the VIDEO_CODEC configured at the top of this script.
-    * Supports GPU codecs (h264_nvenc, h264_amf, h264_qsv) that the
-      original LeRobot encoder rejects.
+def _patch_save_episode(dataset):
+    """Monkey-patch LeRobotDataset.save_episode to use our custom ThreadPoolEncoder
+    and properly resolve JPEGs in TEMP_IMAGE_DIR, bypassing the broken multiprocessing
+    and PNG-only globbing in v0.4.3.
     """
-    def _encode_one(key):
-        video_path = self.root / self.meta.get_video_file_path(episode_index, key)
-        if video_path.is_file():
-            return  # already encoded (resume case)
-        img_dir = self._get_image_file_path(
-            episode_index=episode_index, image_key=key, frame_index=0
-        ).parent
+    _original_save_episode = dataset.save_episode
+
+    def _custom_encode_video(video_key, episode_index):
+        import shutil
+        import tempfile
+        from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
+        
+        temp_path = Path(tempfile.mkdtemp(dir=dataset.root)) / f"{video_key}_{episode_index:03d}.mp4"
+        
+        base = TEMP_IMAGE_DIR if TEMP_IMAGE_DIR is not None else dataset.root
+        fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
+        img_dir = (base / fpath).parent
+        
         _encode_video_frames_custom(
-            img_dir, video_path, self.fps,
-            vcodec=VIDEO_CODEC,
+            img_dir, temp_path, dataset.fps, vcodec=VIDEO_CODEC
         )
-        shutil.rmtree(img_dir)
+            
+        return temp_path
 
-    with ThreadPoolExecutor(max_workers=len(self.meta.video_keys)) as pool:
-        futs = [pool.submit(_encode_one, key) for key in self.meta.video_keys]
-        for f in futs:
-            f.result()  # propagate exceptions
+    def _mock_encode_temp(self, video_key, episode_index):
+        return self._precomputed_temp_paths[video_key]
 
-    # Update video info on first episode (mirrors original behaviour)
-    if len(self.meta.video_keys) > 0 and episode_index == 0:
-        self.meta.update_video_info()
-        from lerobot.datasets.utils import write_info
-        write_info(self.meta.info, self.meta.root)
+    def _save_episode_wrapper(self, episode_data=None, parallel_encoding=True):
+        episode_buffer = episode_data if episode_data is not None else self.episode_buffer
+        episode_index = episode_buffer["episode_index"]
+        if isinstance(episode_index, list) or isinstance(episode_index, np.ndarray):
+            episode_index = int(np.asarray(episode_index).flatten()[0])
+        elif isinstance(episode_index, int):
+            episode_index = episode_index
+
+        has_video_keys = len(self.meta.video_keys) > 0
+        use_batched_encoding = getattr(self, "batch_encoding_size", 1) > 1
+
+        if has_video_keys and not use_batched_encoding:
+            num_cameras = len(self.meta.video_keys)
+            
+            with ThreadPoolExecutor(max_workers=max(1, num_cameras)) as pool:
+                futures = {
+                    pool.submit(_custom_encode_video, key, episode_index): key 
+                    for key in self.meta.video_keys
+                }
+                results = {}
+                for f in futures:
+                    results[futures[f]] = f.result()
+            
+            self._precomputed_temp_paths = results
+            
+            _orig_temp = self._encode_temporary_episode_video
+            self._encode_temporary_episode_video = types.MethodType(_mock_encode_temp, self)
+            
+            try:
+                _original_save_episode(episode_data=episode_data, parallel_encoding=False)
+            finally:
+                self._encode_temporary_episode_video = _orig_temp
+                if hasattr(self, "_precomputed_temp_paths"):
+                    del self._precomputed_temp_paths
+        else:
+            _original_save_episode(episode_data=episode_data, parallel_encoding=parallel_encoding)
+
+    dataset.save_episode = types.MethodType(_save_episode_wrapper, dataset)
 
 
-def _patch_parallel_encoding(dataset):
-    """Monkey-patch a LeRobotDataset instance to use parallel video encoding."""
-    dataset.encode_episode_videos = types.MethodType(
-        _parallel_encode_episode_videos, dataset
-    )
-
-
-def _save_image_jpeg(self, image, fpath: Path) -> None:
+def _save_image_jpeg(self, image, fpath: Path, compress_level: int = 1) -> None:
     """Drop-in replacement for LeRobotDataset._save_image.
 
     Saves as JPEG instead of PNG (5-10x faster) and uses cv2.imwrite
@@ -369,7 +398,7 @@ def _save_image_jpeg(self, image, fpath: Path) -> None:
         else:
             image.save(str(fpath), quality=95)
     else:
-        self.image_writer.save_image(image=image, fpath=fpath)
+        self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
 
 
 def _get_image_file_path_jpg(self, episode_index: int, image_key: str, frame_index: int) -> Path:
@@ -403,9 +432,9 @@ def _patch_jpeg_image_saving(dataset):
         import lerobot.datasets.image_writer as iw
         _original_write_image = iw.write_image
 
-        def _write_image_fast(image, fpath: Path):
+        def _write_image_fast(image, fpath: Path, compress_level: int = 1):
             fpath = Path(fpath)
-            # If the file was pre-placed (hardlink from source), skip writing
+            # HARDLINK OPTIMIZATION: skip writing if the file was pre-placed
             if fpath.exists():
                 return
             if fpath.suffix.lower() in (".jpg", ".jpeg"):
@@ -419,9 +448,9 @@ def _patch_jpeg_image_saving(dataset):
                     fpath.parent.mkdir(parents=True, exist_ok=True)
                     image.save(str(fpath), quality=95)
                 else:
-                    _original_write_image(image, fpath)
+                    _original_write_image(image, fpath, compress_level=compress_level)
             else:
-                _original_write_image(image, fpath)
+                _original_write_image(image, fpath, compress_level=compress_level)
 
         iw.write_image = _write_image_fast
 
@@ -492,10 +521,11 @@ class ConversionWorker(QThread):
     # Dataset creation helpers (shared by pipeline and flat modes)
     # -----------------------------------------------------------------
 
-    def _create_dataset(self, LeRobotDataset, img_shape_endo, img_shape_wrist):
+    def _create_dataset(self, LeRobotDataset, img_shape_endo, img_shape_wrist, output_path: Path):
         """Create a fresh LeRobot dataset with the standard feature schema."""
         dataset = LeRobotDataset.create(
             repo_id=self.dataset_name,
+            root=output_path,
             use_videos=True,
             robot_type="dvrk",
             fps=self.fps,
@@ -550,8 +580,9 @@ class ConversionWorker(QThread):
             image_writer_threads=16,
             tolerance_s=0.1,
             batch_encoding_size=1,  # Encode after each episode for crash resilience
+            vcodec=VIDEO_CODEC,
         )
-        _patch_parallel_encoding(dataset)
+        _patch_save_episode(dataset)
         _patch_jpeg_image_saving(dataset)
         self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
         return dataset
@@ -581,9 +612,9 @@ class ConversionWorker(QThread):
                     partial_vid.unlink()
 
         self.log_message.emit("Loading existing dataset...")
-        dataset = LeRobotDataset(repo_id=self.dataset_name)
+        dataset = LeRobotDataset(repo_id=self.dataset_name, root=output_path)
         dataset.start_image_writer(num_processes=0, num_threads=16)
-        _patch_parallel_encoding(dataset)
+        _patch_save_episode(dataset)
         _patch_jpeg_image_saving(dataset)
         self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
         return dataset
@@ -668,7 +699,7 @@ class ConversionWorker(QThread):
             self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
             self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
             self.log_message.emit("Creating LeRobot dataset...")
-            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
+            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist, output_path)
 
         start_time = time.time()
         successful_episodes = self.skip_count if self.resume_mode else 0
@@ -780,6 +811,10 @@ class ConversionWorker(QThread):
         self.log_message.emit("Cleaning up intermediate images...")
         self._cleanup_all_images(dataset)
 
+        # Flush parquet files for v3.0
+        self.log_message.emit("Finalizing dataset metadata...")
+        dataset.finalize()
+
         elapsed = time.time() - start_time
         self.log_message.emit(f"\n{'='*50}")
         self.log_message.emit("Conversion complete!")
@@ -822,7 +857,7 @@ class ConversionWorker(QThread):
             self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
             self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
             self.log_message.emit("Creating LeRobot dataset...")
-            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
+            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist, output_path)
 
         # Process each episode
         start_time = time.time()
@@ -898,6 +933,10 @@ class ConversionWorker(QThread):
         # Clean up ALL intermediate images at the end
         self.log_message.emit("Cleaning up intermediate images...")
         self._cleanup_all_images(dataset)
+
+        # Flush parquet files for v3.0
+        self.log_message.emit("Finalizing dataset metadata...")
+        dataset.finalize()
 
         elapsed = time.time() - start_time
         self.log_message.emit(f"\n{'='*50}")
@@ -1037,25 +1076,62 @@ class ConversionWorker(QThread):
         )
 
         # ------------------------------------------------------------------
-        # 4. Pre-place source JPEGs & build frames with dummy images
-        #    (Eliminates JPEG decode → re-encode → re-decode round-trip)
+        # 4. Pre-place JPEGs as hardlinks and add zero'd dummy arrays
         # ------------------------------------------------------------------
         from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
+        import shutil as _shutil
 
         fps_inv = 1.0 / self.fps
         t_add_total = 0.0
 
-        # Determine the episode_index LeRobot will use for file paths
         ep_idx_for_paths = dataset.episode_buffer["episode_index"]
         _temp_base = TEMP_IMAGE_DIR if TEMP_IMAGE_DIR is not None else dataset.root
 
-        # Map image keys to their source path lists
         camera_path_map = {
             "observation.images.endoscope.left":  left_paths,
-            "observation.images.endoscope.right": right_paths,
-            "observation.images.wrist.right":     psm1_paths,
-            "observation.images.wrist.left":      psm2_paths,
         }
+        if right_paths: camera_path_map["observation.images.endoscope.right"] = right_paths
+        if psm1_paths: camera_path_map["observation.images.wrist.right"] = psm1_paths
+        if psm2_paths: camera_path_map["observation.images.wrist.left"] = psm2_paths
+
+        # Cache dummy arrays
+        _dummy_cache = {}
+        for img_key in camera_path_map:
+            feat = dataset.features[img_key]
+            shape = tuple(feat["shape"])
+            _dummy_cache[img_key] = np.zeros(shape, dtype=np.uint8)
+
+        t_preplace_start = time.time()
+        preplace_count = 0
+        preplace_fallback = 0
+
+        for img_key, paths in camera_path_map.items():
+            for out_idx in range(total_frames):
+                src_idx = new_start + out_idx
+                if src_idx >= len(paths):
+                    continue
+                source_jpg = paths[src_idx]
+                target_rel = DEFAULT_IMAGE_PATH.format(
+                    image_key=img_key,
+                    episode_index=ep_idx_for_paths,
+                    frame_index=out_idx,
+                )
+                target = (_temp_base / target_rel).with_suffix(".jpg")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    try:
+                        os.link(str(source_jpg), str(target))
+                    except OSError:
+                        _shutil.copy2(str(source_jpg), str(target))
+                        preplace_fallback += 1
+                    preplace_count += 1
+
+        t_preplace = time.time()
+        fallback_msg = f" ({preplace_fallback} fell back to copy)" if preplace_fallback else ""
+        self.log_message.emit(
+            f"  Pre-placed {preplace_count} source JPEGs as hardlinks "
+            f"({t_preplace - t_preplace_start:.1f}s){fallback_msg}"
+        )
 
         # Get image shapes from dataset features for dummy arrays
         _dummy_cache = {}  # image_key -> dummy numpy array
@@ -1120,14 +1196,15 @@ class ConversionWorker(QThread):
                 "instruction.text":  subtask_text,
                 "observation.meta.tool.psm1": self.psm1_tool,
                 "observation.meta.tool.psm2": self.psm2_tool,
+                "task": subtask_text,
             }
-            # Add dummy images for each available camera
-            for img_key, paths in camera_path_map.items():
-                if paths and src_idx < len(paths):
+            # Inject dummy arrays (the hardlinks skip writing process)
+            for img_key in camera_path_map:
+                if src_idx < len(camera_path_map[img_key]):
                     frame[img_key] = _dummy_cache[img_key]
 
             t0 = time.time()
-            dataset.add_frame(frame, task=subtask_text, timestamp=frame_idx * fps_inv)
+            dataset.add_frame(frame)
             t_add_total += time.time() - t0
 
         t_end = time.time()
@@ -1220,15 +1297,16 @@ class ConversionWorker(QThread):
         )
 
         # ------------------------------------------------------------------
-        # 4. Pipelined frame processing
-        #    16 workers pre-build frame dicts (image loading + dict assembly)
-        #    while the main thread just calls add_frame().
+        # 4. Pre-place JPEGs as hardlinks and add zero'd dummy arrays
         # ------------------------------------------------------------------
-        PIPELINE_DEPTH = 64
-        NUM_WORKERS = 16
+        from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
+        import shutil as _shutil
 
         fps_inv = 1.0 / self.fps
         t_add_total = 0.0
+
+        ep_idx_for_paths = dataset.episode_buffer["episode_index"]
+        _temp_base = TEMP_IMAGE_DIR if TEMP_IMAGE_DIR is not None else dataset.root
 
         # Pre-build path lists for fast indexing
         left_paths  = [f.path for f in left_frames]
@@ -1241,43 +1319,54 @@ class ConversionWorker(QThread):
         psm1_idx_arr  = secondary_indices.get("endo_psm1")
         psm2_idx_arr  = secondary_indices.get("endo_psm2")
 
-        def _build_frame(out_idx):
-            """Build a complete frame dict -- runs in worker thread.
-            cv2.imread releases the GIL so threads truly run in parallel."""
-            left_idx = final_left_indices[out_idx]
-            csv_idx  = kinematics_indices[out_idx]
+        camera_path_map = {}
+        # We need to map img_key -> list of mapped source paths for this episode length
+        camera_path_map["observation.images.endoscope.left"] = [left_paths[idx] for idx in final_left_indices]
 
-            left_img = self._load_image_cv2(left_paths[left_idx])
+        if right_idx_arr is not None and right_paths:
+            camera_path_map["observation.images.endoscope.right"] = [right_paths[idx] for idx in right_idx_arr]
+        if psm1_idx_arr is not None and psm1_paths:
+            camera_path_map["observation.images.wrist.right"] = [psm1_paths[idx] for idx in psm1_idx_arr]
+        if psm2_idx_arr is not None and psm2_paths:
+            camera_path_map["observation.images.wrist.left"] = [psm2_paths[idx] for idx in psm2_idx_arr]
 
-            frame = {
-                "observation.state": states_matrix[csv_idx],
-                "action": actions_matrix[csv_idx],
-                "instruction.text": task_text,
-                "observation.meta.tool.psm1": self.psm1_tool,
-                "observation.meta.tool.psm2": self.psm2_tool,
-                "observation.images.endoscope.left": left_img,
-            }
+        # Cache dummy arrays
+        _dummy_cache = {}
+        for img_key in camera_path_map:
+            feat = dataset.features[img_key]
+            shape = tuple(feat["shape"])
+            _dummy_cache[img_key] = np.zeros(shape, dtype=np.uint8)
 
-            if right_idx_arr is not None and right_paths:
-                frame["observation.images.endoscope.right"] = self._load_image_cv2(
-                    right_paths[right_idx_arr[out_idx]]
+        t_preplace_start = time.time()
+        preplace_count = 0
+        preplace_fallback = 0
+
+        for img_key, paths in camera_path_map.items():
+            for out_idx in range(total_frames):
+                if out_idx >= len(paths):
+                    continue
+                source_jpg = paths[out_idx]
+                target_rel = DEFAULT_IMAGE_PATH.format(
+                    image_key=img_key,
+                    episode_index=ep_idx_for_paths,
+                    frame_index=out_idx,
                 )
-            if psm1_idx_arr is not None and psm1_paths:
-                frame["observation.images.wrist.right"] = self._load_image_cv2(
-                    psm1_paths[psm1_idx_arr[out_idx]]
-                )
-            if psm2_idx_arr is not None and psm2_paths:
-                frame["observation.images.wrist.left"] = self._load_image_cv2(
-                    psm2_paths[psm2_idx_arr[out_idx]]
-                )
-            return frame
+                target = (_temp_base / target_rel).with_suffix(".jpg")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    try:
+                        os.link(str(source_jpg), str(target))
+                    except OSError:
+                        _shutil.copy2(str(source_jpg), str(target))
+                        preplace_fallback += 1
+                    preplace_count += 1
 
-        pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
-
-        # Seed the pipeline with initial batch of futures
-        futures = {}
-        for i in range(min(PIPELINE_DEPTH, total_frames)):
-            futures[i] = pool.submit(_build_frame, i)
+        t_preplace = time.time()
+        fallback_msg = f" ({preplace_fallback} fell back to copy)" if preplace_fallback else ""
+        self.log_message.emit(
+            f"  Pre-placed {preplace_count} source JPEGs as hardlinks "
+            f"({t_preplace - t_preplace_start:.1f}s){fallback_msg}"
+        )
 
         for frame_idx in range(total_frames):
             # Progress every 500 frames
@@ -1288,17 +1377,23 @@ class ConversionWorker(QThread):
                     f"(avg add_frame={avg_add:.1f}ms)"
                 )
 
-            frame = futures.pop(frame_idx).result()
-
-            next_idx = frame_idx + PIPELINE_DEPTH
-            if next_idx < total_frames:
-                futures[next_idx] = pool.submit(_build_frame, next_idx)
+            csv_idx = kinematics_indices[frame_idx]
+            frame = {
+                "observation.state": states_matrix[csv_idx],
+                "action": actions_matrix[csv_idx],
+                "instruction.text": task_text,
+                "observation.meta.tool.psm1": self.psm1_tool,
+                "observation.meta.tool.psm2": self.psm2_tool,
+                "task": task_text,
+            }
+            # Inject dummy arrays (the hardlinks skip writing process)
+            for img_key in camera_path_map:
+                if frame_idx < len(camera_path_map[img_key]):
+                    frame[img_key] = _dummy_cache[img_key]
 
             t0 = time.time()
-            dataset.add_frame(frame, task=task_text, timestamp=frame_idx * fps_inv)
+            dataset.add_frame(frame)
             t_add_total += time.time() - t0
-
-        pool.shutdown(wait=False)
 
         t_end = time.time()
         self.log_message.emit(
@@ -1346,7 +1441,7 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         
         # Title
-        title = QLabel("DVRK → LeRobot v2.1 Converter")
+        title = QLabel("DVRK → LeRobot v3.0 Converter")
         title.setFont(QFont("Arial", 18, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #2c3e50; margin: 10px;")

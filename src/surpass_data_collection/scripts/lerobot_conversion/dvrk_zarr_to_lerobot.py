@@ -430,8 +430,15 @@ def convert_data_to_lerobot(
         # Critical: Ensure all background video writing threads finish before exiting.
         # Without this, the last few videos might not be saved to disk.
         print("Stopping image writer and ensuring all data is persisted...")
-        dataset.stop_image_writer()
-        print("Image writer stopped.")
+        if lerobot.__version__ == "0.4.3":
+            dataset.finalize()            # IMPORTANT in v3.0
+        dataset.stop_image_writer()   # cleanup video writer
+        print("Done!")
+    
+    if push_to_hub:
+        print(f"Pushing dataset to Hugging Face Hub: {repo_id} …")
+        dataset.push_to_hub()
+        print("Push to Hub complete!")
 
 
 def main(
