@@ -1392,7 +1392,7 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         
         # Title
-        title = QLabel("DVRK → LeRobot v2.1 Converter")
+        title = QLabel("DVRK → LeRobot v3.0 Converter")
         title.setFont(QFont("Arial", 18, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("color: #2c3e50; margin: 10px;")
