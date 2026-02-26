@@ -4,5 +4,5 @@ matplotlib
 pandas
 tyro
 PIL
-lerobot==0.3.3 # Not needed for data collection. Uncomment if you want to convert to lerobot format.
-huggingface-hub==0.34.4 # Not needed for data collection. Uncomment if you want to convert to lerobot format.
+lerobot
+huggingface-hub

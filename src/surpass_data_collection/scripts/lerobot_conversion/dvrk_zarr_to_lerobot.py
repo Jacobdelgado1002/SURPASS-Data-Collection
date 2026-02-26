@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-A script to convert DVRK (da Vinci Research Kit) robotics data into the LeRobot format (v2.1).
+A script to convert DVRK (da Vinci Research Kit) robotics data into the LeRobot format (v3.0).
 
 This script processes DVRK surgical robot datasets organized in directory structures
 with CSV kinematics data and multiple camera views. It handles both perfect and
@@ -51,6 +51,7 @@ Dependencies:
 - numpy
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -62,9 +63,10 @@ from PIL import Image
 import time
 from tqdm import tqdm
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.constants import HF_LEROBOT_HOME
-
 from lerobot.datasets.utils import write_info
+
+HF_CACHE = Path(os.environ.get("HF_HOME") if os.environ.get("HF_HOME") is not None else "~/.cache/huggingface")
+HF_LEROBOT_HOME = HF_CACHE / "lerobot"
 
 states_name = [
     "psm1_pose.position.x",
@@ -102,6 +104,89 @@ actions_name = [
     "psm2_sp.orientation.w",
     "psm2_jaw_sp",
 ]
+
+import numpy as np
+
+
+def safe_normalize(q, eps=1e-8):
+    norm = np.linalg.norm(q)
+    if norm < eps:
+        # fallback to identity rotation
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    return q / norm
+
+
+def quat_inverse(q):
+    q = safe_normalize(q)
+    q_conj = q.copy()
+    q_conj[:3] *= -1.0
+    return q_conj  # safe since unit
+
+
+def quat_multiply(q1, q2):
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+
+    return np.array([
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ], dtype=np.float32)
+
+
+def ensure_quat_continuity(q_prev, q_curr):
+    """
+    Ensures shortest path by preventing sign flips.
+    """
+    if np.dot(q_prev, q_curr) < 0:
+        return -q_curr
+    return q_curr
+    
+
+def compute_action_hybrid_rel(action_t, action_next):
+    """
+    actions: (T, 16) array
+    Returns:
+        rel_actions: (T, 16) array
+    """
+
+    rel_action = np.zeros_like(action_t)
+
+    for psm_arm in range(2):
+        base = psm_arm * 8
+
+        # --- current ---
+        p_t = action_t[base:base+3]
+        q_t = action_t[base+3:base+7]
+
+        # --- next ---
+        p_next = action_next[base:base+3]
+        q_next = action_next[base+3:base+7]
+
+        # Normalize
+        q_t = safe_normalize(q_t)
+        q_next = safe_normalize(q_next)
+
+        # Fix sign ambiguity
+        q_next = ensure_quat_continuity(q_t, q_next)
+
+        # Relative position (frame 1)
+        dp = p_next - p_t
+
+        # Relative quaternion (local frame)
+        q_inv = quat_inverse(q_t)
+        dq = quat_multiply(q_inv, q_next)
+        dq = safe_normalize(dq)
+
+        # Normalize for safety
+        dq = dq / np.linalg.norm(dq)
+
+        rel_action[base:base+3] = dp
+        rel_action[base+3:base+7] = dq
+        rel_action[base+7] = action_t[base+7]
+
+    return rel_action.astype(np.float32)
 
 
 def read_images(image_dir: str, file_pattern: str, target_shape: tuple | None = None) -> np.ndarray:
@@ -206,17 +291,19 @@ def process_episode(
     # print(kinematics_data[0])
 
     # Create frame dictionary for each timestamp
-    for i in range(num_frames):
+    for i in range(num_frames-1):
+        action = np.hstack([kinematics_data[n][i] for n in actions_name]).astype(np.float32)
+        action_next = np.hstack([kinematics_data[n][i+1] for n in actions_name]).astype(np.float32)
         frame = {
             "observation.state": np.hstack(
                 [kinematics_data[n][i] for n in states_name]
             ).astype(np.float32),
-            "action": np.hstack([kinematics_data[n][i] for n in actions_name]).astype(
-                np.float32
-            ),
+            "action": action,
+            "action_hybrid_relative": compute_action_hybrid_rel(action, action_next),
             "instruction.text": subtask_prompt,
             "observation.meta.tool.psm1": "Permanent Cautery Hook",
             "observation.meta.tool.psm2": "Prograsp Forceps",
+            "task": subtask_prompt
         }
 
         for cam_name, images in [
@@ -228,7 +315,7 @@ def process_episode(
             if images.size > 0:
                 frame[f"observation.images.{cam_name}"] = images[i]
         timestamp_sec = kinematics_data["timestamp"][i]
-        dataset.add_frame(frame, task=subtask_prompt, timestamp=timestamp_sec)
+        dataset.add_frame(frame)
 
     return dataset
 
@@ -294,6 +381,11 @@ def convert_data_to_lerobot(
                 "names": [states_name],
             },
             "action": {
+                "dtype": "float32",
+                "shape": (len(actions_name),),
+                "names": [actions_name],
+            },
+            "action_hybrid_relative": {
                 "dtype": "float32",
                 "shape": (len(actions_name),),
                 "names": [actions_name],
