@@ -632,26 +632,23 @@ class ConversionWorker(QThread):
         filtered_dir = self.output_dir / "_filtered_cache"
         max_time_diff_ms = self.fps
 
-        if filtered_dir.exists():
-            self.log_message.emit("Stage 1/3: Using cached filtered data (delete _filtered_cache to re-run)")
-        else:
-            self.log_message.emit(
-                f"Stage 1/3: Filtering & synchronising episodes "
-                f"(threshold={max_time_diff_ms:.1f}ms)..."
-            )
-            rc = run_filter_episodes(
-                source_dir=str(self.source_path),
-                out_dir=str(filtered_dir),
-                max_time_diff=max_time_diff_ms,
-                min_images=10,
-                dry_run=False,
-                overwrite=False,
-                use_hardlink=True,
-            )
-            if rc != 0:
-                self.finished_signal.emit(False, "Filtering stage failed. Check logs.")
-                return
-            self.log_message.emit("  Filtering complete.")
+        self.log_message.emit(
+            f"Stage 1/3: Filtering & synchronising episodes "
+            f"(threshold={max_time_diff_ms:.1f}ms)..."
+        )
+        rc = run_filter_episodes(
+            source_dir=str(self.source_path),
+            out_dir=str(filtered_dir),
+            max_time_diff=max_time_diff_ms,
+            min_images=10,
+            dry_run=False,
+            overwrite=False,
+            use_hardlink=True,
+        )
+        if rc != 0:
+            self.finished_signal.emit(False, "Filtering stage failed. Check logs.")
+            return
+        self.log_message.emit("  Filtering complete.")
 
         if self.cancelled:
             self.finished_signal.emit(False, "Cancelled by user")
@@ -728,6 +725,10 @@ class ConversionWorker(QThread):
             # Skip already-converted episodes during resume
             if self.resume_mode and valid_seen < self.skip_count:
                 valid_seen += 1
+                if is_recovery:
+                    recovery_count += 1
+                else:
+                    perfect_count += 1
                 self.log_message.emit(f"⏭ Skipping (already converted): {dst.name}")
                 continue
 
@@ -1084,7 +1085,10 @@ class ConversionWorker(QThread):
         fps_inv = 1.0 / self.fps
         t_add_total = 0.0
 
-        ep_idx_for_paths = dataset.episode_buffer["episode_index"]
+        # In LeRobot v3.0, episode_buffer is initialized lazily on the first add_frame().
+        # When resuming, it's None until we actually add a frame.
+        # The next episode index is simply the current number of episodes in the dataset.
+        ep_idx_for_paths = len(dataset.meta.episodes) if dataset.meta.episodes else 0
         _temp_base = TEMP_IMAGE_DIR if TEMP_IMAGE_DIR is not None else dataset.root
 
         camera_path_map = {
@@ -1133,54 +1137,6 @@ class ConversionWorker(QThread):
             f"({t_preplace - t_preplace_start:.1f}s){fallback_msg}"
         )
 
-        # Get image shapes from dataset features for dummy arrays
-        _dummy_cache = {}  # image_key -> dummy numpy array
-        for img_key in camera_path_map:
-            feat = dataset.features[img_key]
-            shape = tuple(feat["shape"])  # (c, h, w) or (h, w, c)
-            _dummy_cache[img_key] = np.zeros(shape, dtype=np.uint8)
-
-        # Pre-place source JPEGs as hardlinks at the paths LeRobot expects.
-        # This lets ffmpeg read the original files directly during encoding,
-        # completely skipping the decode→numpy→encode→write cycle.
-        t_preplace_start = time.time()
-        preplace_count = 0
-        preplace_fallback_count = 0
-        import shutil as _shutil
-
-        for img_key, paths in camera_path_map.items():
-            if not paths:
-                continue
-            for out_idx in range(total_frames):
-                src_idx = new_start + out_idx
-                if src_idx >= len(paths):
-                    continue
-                source_jpg = paths[src_idx]
-                target_rel = DEFAULT_IMAGE_PATH.format(
-                    image_key=img_key,
-                    episode_index=ep_idx_for_paths,
-                    frame_index=out_idx,
-                )
-                target = (_temp_base / target_rel).with_suffix(".jpg")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if not target.exists():
-                    try:
-                        os.link(str(source_jpg), str(target))
-                    except (OSError, NotImplementedError):
-                        _shutil.copy2(str(source_jpg), str(target))
-                        preplace_fallback_count += 1
-                    preplace_count += 1
-
-        t_preplace = time.time()
-        self.log_message.emit(
-            f"  Pre-placed {preplace_count} source JPEGs as hardlinks "
-            f"({t_preplace - t_preplace_start:.1f}s)"
-            + (f" ({preplace_fallback_count} fell back to copy)" if preplace_fallback_count else "")
-        )
-
-        # Build and add frames using lightweight dummy image arrays.
-        # The dummy arrays pass LeRobot's shape validation, and _write_image_fast
-        # skips writing because the file already exists on disk.
         for frame_idx in range(total_frames):
             if frame_idx > 0 and frame_idx % 500 == 0:
                 avg_add = (t_add_total / frame_idx) * 1000
@@ -1305,7 +1261,10 @@ class ConversionWorker(QThread):
         fps_inv = 1.0 / self.fps
         t_add_total = 0.0
 
-        ep_idx_for_paths = dataset.episode_buffer["episode_index"]
+        # In LeRobot v3.0, episode_buffer is initialized lazily on the first add_frame().
+        # When resuming, it's None until we actually add a frame.
+        # The next episode index is simply the current number of episodes in the dataset.
+        ep_idx_for_paths = len(dataset.meta.episodes) if dataset.meta.episodes else 0
         _temp_base = TEMP_IMAGE_DIR if TEMP_IMAGE_DIR is not None else dataset.root
 
         # Pre-build path lists for fast indexing
@@ -1675,29 +1634,17 @@ class MainWindow(QMainWindow):
         self.output_preview.setText(f"Full output path: {full_path}")
     
     def _count_completed_episodes(self, output_path: Path) -> int:
-        """Count fully completed episodes by checking parquet + all 4 video files exist."""
-        VIDEO_KEYS = [
-            "observation.images.endoscope.left",
-            "observation.images.endoscope.right",
-            "observation.images.wrist.left",
-            "observation.images.wrist.right",
-        ]
-        idx = 0
-        while True:
-            ep_name = f"episode_{idx:06d}"
-            # Check parquet (could be in any chunk dir)
-            parquet_matches = list((output_path / "data").glob(f"chunk-*/{ep_name}.parquet"))
-            if not parquet_matches:
-                break
-            # Check all 4 video files (inside chunk-*/key/ dirs)
-            all_videos = all(
-                list((output_path / "videos").glob(f"chunk-*/{key}/{ep_name}.mp4"))
-                for key in VIDEO_KEYS
-            )
-            if not all_videos:
-                break
-            idx += 1
-        return idx
+        """Count fully completed episodes by reading LeRobot's info.json metadata."""
+        import json
+        info_path = output_path / "meta" / "info.json"
+        if info_path.exists():
+            try:
+                with open(info_path, "r", encoding="utf-8") as f:
+                    info = json.load(f)
+                return info.get("total_episodes", 0)
+            except Exception:
+                return 0
+        return 0
     
     def _start_conversion(self):
         """Start the conversion process"""
@@ -1721,7 +1668,7 @@ class MainWindow(QMainWindow):
                 msg = QMessageBox(self)
                 msg.setWindowTitle("Resume or Start Over?")
                 msg.setText(
-                    f"Found {completed} fully completed episodes (0–{completed - 1}) in:\n{output_path}\n\n"
+                    f"Found {completed} fully completed episodes (0-{completed - 1}) in:\n{output_path}\n\n"
                     f"Resume from episode {completed}?"
                 )
                 resume_btn = msg.addButton("Resume", QMessageBox.AcceptRole)

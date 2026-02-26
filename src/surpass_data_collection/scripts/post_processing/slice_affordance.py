@@ -702,6 +702,11 @@ def plan_episodes(
         f"{sessions_found} sessions"
     )
 
+    # CRITICAL: Sort planned episodes deterministically by destination path.
+    # On Windows/Linux, iterdir() is arbitrary. Without sorting, the GUI's 
+    # 'skip_count' resume logic will skip random episodes instead of the oldest ones.
+    planned_episodes.sort(key=lambda x: str(x[3]))
+
     return planned_episodes
 
 
