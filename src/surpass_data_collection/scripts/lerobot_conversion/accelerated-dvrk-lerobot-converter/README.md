@@ -14,7 +14,7 @@ Two versions are provided to support different LeRobot versions and pipeline req
 - **Extreme Encoding Optimization**: Pre-places uncompressed camera JPEGs via hardlinks into fast NVMe caching (`TEMP_IMAGE_DIR`) to bypass Python decode/encode bottlenecks—letting FFmpeg crunch raw bytes natively.
 - **NVIDIA GPU Acceleration**: Native bindings for GPU video decoding/encoding inside LeRobot processes
 - **Pipeline Integration (v3.0)**: Reads slice boundaries dynamically from annotation CSVs, slicing NumPy RAM arrays without creating physical copies of the frames.
-- **Resume Support**: Safely detects completed chunks and resumes partial encodes.
+- **Robustness**: Enforces clean dataset rebuilds and automatically purges stale intermediate caching directories to guarantee frame-perfect video encoding.
 
 ## Requirements
 
@@ -103,9 +103,9 @@ python dvrk_lerobot_converter_gui_v2.1.py
 4. Set the **Video Codec** to `h264_nvenc` for NVIDIA hardware acceleration.
 5. Click **Start Conversion**.
 
-### Resuming
+### Clean Rebuilds
 
-If the conversion is interrupted (crash, cancel, power loss), re-run the tool with the same output directory and dataset name. It will detect the existing partial dataset and offer to **Resume** from where it left off.
+To prevent data corruption and ensure frame-perfect encoding, the converters enforce a **Full Rebuild Only** strategy. If the output dataset already exists, it will prompt you to overwrite it safely. Stale intermediate frame caches are automatically purged before each conversion to prevent silent video encoding issues (e.g. black frames) when rebuilding.
 
 ## Output
 

@@ -74,10 +74,10 @@ CODEC_OPTIONS = {
     "h264_qsv (Intel Quick Sync)":          "h264_qsv",
     "libsvtav1 (CPU — best compression, VERY SLOW)": "libsvtav1",
 }
-DEFAULT_CODEC_LABEL = "h264_nvenc (NVIDIA GPU — fastest)"
+DEFAULT_CODEC_LABEL = "h264 (CPU — works everywhere)"
 
 # This global is updated from the GUI before conversion starts
-VIDEO_CODEC = "h264_nvenc"
+VIDEO_CODEC = "h264"
 
 # Intermediate image directory — use a FAST LOCAL drive (NVMe/SSD) to avoid
 # bottlenecking encoding on the (possibly slower) dataset output drive.
@@ -323,8 +323,6 @@ def _parallel_encode_episode_videos(self, episode_index: int) -> None:
     """
     def _encode_one(key):
         video_path = self.root / self.meta.get_video_file_path(episode_index, key)
-        if video_path.is_file():
-            return  # already encoded (resume case)
         img_dir = self._get_image_file_path(
             episode_index=episode_index, image_key=key, frame_index=0
         ).parent
@@ -440,8 +438,7 @@ class ConversionWorker(QThread):
     
     def __init__(self, source_path: Path, output_dir: Path, dataset_name: str,
                  psm1_tool: str, psm2_tool: str, fps: int,
-                 annotations_dir: Optional[Path] = None,
-                 resume_mode: bool = False, skip_count: int = 0):
+                 annotations_dir: Optional[Path] = None):
         super().__init__()
         self.source_path = source_path
         self.output_dir = output_dir
@@ -450,8 +447,6 @@ class ConversionWorker(QThread):
         self.psm2_tool = psm2_tool
         self.fps = fps
         self.annotations_dir = annotations_dir
-        self.resume_mode = resume_mode
-        self.skip_count = skip_count
         self.cancelled = False
     
     def cancel(self):
@@ -556,37 +551,7 @@ class ConversionWorker(QThread):
         self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
         return dataset
 
-    def _init_resume_dataset(self, LeRobotDataset, output_path):
-        """Resume an existing dataset, cleaning up partial data."""
-        self.log_message.emit(f"Resuming: {self.skip_count} episodes already completed")
 
-        # Clean up stale intermediate images
-        for stale_dir in [output_path / "images",
-                          TEMP_IMAGE_DIR / "images" if TEMP_IMAGE_DIR else None]:
-            if stale_dir and stale_dir.exists():
-                self.log_message.emit(f"Cleaning up stale intermediate images in {stale_dir}...")
-                shutil.rmtree(stale_dir)
-
-        # Remove partial files for the first incomplete episode
-        partial_ep = f"episode_{self.skip_count:06d}"
-        for parquet in (output_path / "data").glob(f"chunk-*/{partial_ep}.parquet"):
-            self.log_message.emit(f"Removing partial parquet: {parquet.name}")
-            parquet.unlink()
-        videos_dir = output_path / "videos"
-        if videos_dir.exists():
-            for video_key_dir in videos_dir.iterdir():
-                partial_vid = video_key_dir / f"{partial_ep}.mp4"
-                if partial_vid.exists():
-                    self.log_message.emit(f"Removing partial video: {video_key_dir.name}/{partial_vid.name}")
-                    partial_vid.unlink()
-
-        self.log_message.emit("Loading existing dataset...")
-        dataset = LeRobotDataset(repo_id=self.dataset_name)
-        dataset.start_image_writer(num_processes=0, num_threads=16)
-        _patch_parallel_encoding(dataset)
-        _patch_jpeg_image_saving(dataset)
-        self.log_message.emit(f"  Image writer: 16 threads (JPEG)  |  Video encoding: parallel, codec={VIDEO_CODEC}")
-        return dataset
 
     # -----------------------------------------------------------------
     # Pipeline mode: filter → plan → convert
@@ -601,26 +566,23 @@ class ConversionWorker(QThread):
         filtered_dir = self.output_dir / "_filtered_cache"
         max_time_diff_ms = self.fps
 
-        if filtered_dir.exists():
-            self.log_message.emit("Stage 1/3: Using cached filtered data (delete _filtered_cache to re-run)")
-        else:
-            self.log_message.emit(
-                f"Stage 1/3: Filtering & synchronising episodes "
-                f"(threshold={max_time_diff_ms:.1f}ms)..."
-            )
-            rc = run_filter_episodes(
-                source_dir=str(self.source_path),
-                out_dir=str(filtered_dir),
-                max_time_diff=max_time_diff_ms,
-                min_images=10,
-                dry_run=False,
-                overwrite=False,
-                use_hardlink=True,
-            )
-            if rc != 0:
-                self.finished_signal.emit(False, "Filtering stage failed. Check logs.")
-                return
-            self.log_message.emit("  Filtering complete.")
+        self.log_message.emit(
+            f"Stage 1/3: Filtering & synchronising episodes "
+            f"(threshold={max_time_diff_ms:.1f}ms)..."
+        )
+        rc = run_filter_episodes(
+            source_dir=str(self.source_path),
+            out_dir=str(filtered_dir),
+            max_time_diff=max_time_diff_ms,
+            min_images=10,
+            dry_run=False,
+            overwrite=False,
+            use_hardlink=True,
+        )
+        if rc != 0:
+            self.finished_signal.emit(False, "Filtering stage failed. Check logs.")
+            return
+        self.log_message.emit("  Filtering complete.")
 
         if self.cancelled:
             self.finished_signal.emit(False, "Cancelled by user")
@@ -656,25 +618,27 @@ class ConversionWorker(QThread):
         self.log_message.emit("Stage 3/3: Converting to LeRobot format...")
         output_path = self.output_dir / self.dataset_name
         self.log_message.emit(f"Output path: {output_path}")
-        if self.resume_mode:
-            dataset = self._init_resume_dataset(LeRobotDataset, output_path)
-        else:
-            if output_path.exists():
-                self.log_message.emit(f"Removing existing dataset at {output_path}")
-                shutil.rmtree(output_path)
-            # Get image shapes from first planned episode
-            first_src_session = planned[0][2]  # src_session_dir
-            img_shape_endo, img_shape_wrist = self._get_image_shapes([first_src_session])
-            self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
-            self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
-            self.log_message.emit("Creating LeRobot dataset...")
-            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
+        if output_path.exists():
+            self.log_message.emit(f"Removing existing dataset at {output_path}")
+            shutil.rmtree(output_path)
+        # Also clear TEMP_IMAGE_DIR to prevent stale hardlinks from a previous run
+        if TEMP_IMAGE_DIR is not None:
+            temp_images = TEMP_IMAGE_DIR / "images"
+            if temp_images.exists():
+                shutil.rmtree(temp_images)
+                self.log_message.emit(f"Cleared stale temp images: {temp_images}")
+        # Get image shapes from first planned episode
+        first_src_session = planned[0][2]  # src_session_dir
+        img_shape_endo, img_shape_wrist = self._get_image_shapes([first_src_session])
+        self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
+        self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
+        self.log_message.emit("Creating LeRobot dataset...")
+        dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
 
         start_time = time.time()
-        successful_episodes = self.skip_count if self.resume_mode else 0
+        successful_episodes = 0
         perfect_count = 0
         recovery_count = 0
-        valid_seen = 0
         episode_times = []  # Track per-episode durations for ETA
 
         for i, (ann, ref, src, dst, start, end) in enumerate(planned):
@@ -693,12 +657,6 @@ class ConversionWorker(QThread):
 
             self.progress.emit(i, len(planned))
             self.episode_started.emit(f"{dst.parent.name}/{dst.name}")
-
-            # Skip already-converted episodes during resume
-            if self.resume_mode and valid_seen < self.skip_count:
-                valid_seen += 1
-                self.log_message.emit(f"⏭ Skipping (already converted): {dst.name}")
-                continue
 
             try:
                 t_ep_start = time.time()
@@ -726,7 +684,7 @@ class ConversionWorker(QThread):
 
                 # Compute and emit ETA
                 elapsed = time.time() - start_time
-                completed_count = i + 1 - (self.skip_count if self.resume_mode else 0)
+                completed_count = i + 1
                 remaining_count = len(planned) - (i + 1)
                 if completed_count > 0 and remaining_count > 0:
                     # Use recent episodes (last 5) for better estimate
@@ -812,22 +770,24 @@ class ConversionWorker(QThread):
         output_path = self.output_dir / self.dataset_name
         self.log_message.emit(f"Output path: {output_path}")
 
-        if self.resume_mode:
-            dataset = self._init_resume_dataset(LeRobotDataset, output_path)
-        else:
-            if output_path.exists():
-                self.log_message.emit(f"Removing existing dataset at {output_path}")
-                shutil.rmtree(output_path)
-            img_shape_endo, img_shape_wrist = self._get_image_shapes(episodes)
-            self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
-            self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
-            self.log_message.emit("Creating LeRobot dataset...")
-            dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
+        if output_path.exists():
+            self.log_message.emit(f"Removing existing dataset at {output_path}")
+            shutil.rmtree(output_path)
+        # Also clear TEMP_IMAGE_DIR to prevent stale hardlinks from a previous run
+        if TEMP_IMAGE_DIR is not None:
+            temp_images = TEMP_IMAGE_DIR / "images"
+            if temp_images.exists():
+                shutil.rmtree(temp_images)
+                self.log_message.emit(f"Cleared stale temp images: {temp_images}")
+        img_shape_endo, img_shape_wrist = self._get_image_shapes(episodes)
+        self.log_message.emit(f"Endoscope image shape: {img_shape_endo}")
+        self.log_message.emit(f"Wrist camera image shape: {img_shape_wrist}")
+        self.log_message.emit("Creating LeRobot dataset...")
+        dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
 
         # Process each episode
         start_time = time.time()
-        successful_episodes = self.skip_count if self.resume_mode else 0
-        valid_seen = 0
+        successful_episodes = 0
 
         # Derive a default task text from the source directory name
         default_task_text = self.source_path.name.replace("_", " ")
@@ -845,12 +805,6 @@ class ConversionWorker(QThread):
             is_valid, error_msg = validate_episode(episode_path)
             if not is_valid:
                 self.log_message.emit(f"⚠ Skipping invalid episode {episode_path.name}: {error_msg}")
-                continue
-
-            # Skip already-converted episodes during resume
-            if self.resume_mode and valid_seen < self.skip_count:
-                valid_seen += 1
-                self.log_message.emit(f"⏭ Skipping (already converted): {episode_path.name}")
                 continue
 
             try:
@@ -1046,7 +1000,7 @@ class ConversionWorker(QThread):
         t_add_total = 0.0
 
         # Determine the episode_index LeRobot will use for file paths
-        ep_idx_for_paths = dataset.episode_buffer["episode_index"]
+        ep_idx_for_paths = dataset.meta.total_episodes
         _temp_base = TEMP_IMAGE_DIR if TEMP_IMAGE_DIR is not None else dataset.root
 
         # Map image keys to their source path lists
@@ -1579,30 +1533,7 @@ class MainWindow(QMainWindow):
         full_path = self.output_dir / dataset_name
         self.output_preview.setText(f"Full output path: {full_path}")
     
-    def _count_completed_episodes(self, output_path: Path) -> int:
-        """Count fully completed episodes by checking parquet + all 4 video files exist."""
-        VIDEO_KEYS = [
-            "observation.images.endoscope.left",
-            "observation.images.endoscope.right",
-            "observation.images.wrist.left",
-            "observation.images.wrist.right",
-        ]
-        idx = 0
-        while True:
-            ep_name = f"episode_{idx:06d}"
-            # Check parquet (could be in any chunk dir)
-            parquet_matches = list((output_path / "data").glob(f"chunk-*/{ep_name}.parquet"))
-            if not parquet_matches:
-                break
-            # Check all 4 video files (inside chunk-*/key/ dirs)
-            all_videos = all(
-                list((output_path / "videos").glob(f"chunk-*/{key}/{ep_name}.mp4"))
-                for key in VIDEO_KEYS
-            )
-            if not all_videos:
-                break
-            idx += 1
-        return idx
+
     
     def _start_conversion(self):
         """Start the conversion process"""
@@ -1615,41 +1546,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter a dataset name.")
             return
         
-        # Check for existing dataset — offer resume or overwrite
-        resume_mode = False
-        skip_count = 0
+        # Check for existing dataset — offer overwrite or cancel
         output_path = self.output_dir / dataset_name
         if output_path.exists():
-            completed = self._count_completed_episodes(output_path)
-            if completed > 0:
-                # Offer resume
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Resume or Start Over?")
-                msg.setText(
-                    f"Found {completed} fully completed episodes (0–{completed - 1}) in:\n{output_path}\n\n"
-                    f"Resume from episode {completed}?"
-                )
-                resume_btn = msg.addButton("Resume", QMessageBox.AcceptRole)
-                start_over_btn = msg.addButton("Start Over", QMessageBox.DestructiveRole)
-                msg.addButton(QMessageBox.Cancel)
-                msg.exec_()
-                
-                clicked = msg.clickedButton()
-                if clicked == resume_btn:
-                    resume_mode = True
-                    skip_count = completed
-                elif clicked == start_over_btn:
-                    resume_mode = False
-                else:
-                    return  # Cancel
-            else:
-                reply = QMessageBox.question(
-                    self, "Dataset Exists",
-                    f"Dataset already exists at:\n{output_path}\n\nOverwrite?",
-                    QMessageBox.Yes | QMessageBox.No
-                )
-                if reply != QMessageBox.Yes:
-                    return
+            reply = QMessageBox.question(
+                self, "Dataset Exists",
+                f"Dataset already exists at:\n{output_path}\n\nOverwrite?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
         
         # Set the video codec from the dropdown
         global VIDEO_CODEC
@@ -1670,10 +1576,7 @@ class MainWindow(QMainWindow):
         self.eta_label.setText("")
         
         self.log_text.clear()
-        if resume_mode:
-            self._log(f"Resuming conversion from episode {skip_count}...")
-        else:
-            self._log("Starting conversion...")
+        self._log("Starting conversion...")
         
         # Create and start worker thread
         self.worker = ConversionWorker(
@@ -1684,8 +1587,6 @@ class MainWindow(QMainWindow):
             psm2_tool=self.psm2_tool_edit.text().strip(),
             fps=self.fps_spinbox.value(),
             annotations_dir=self.annotations_path,
-            resume_mode=resume_mode,
-            skip_count=skip_count,
         )
         
         self.worker.progress.connect(self._on_progress)
