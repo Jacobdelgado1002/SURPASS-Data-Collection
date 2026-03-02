@@ -127,6 +127,86 @@ ACTIONS_NAME = [
     "psm2_jaw_sp",
 ]
 
+def safe_normalize(q, eps=1e-8):
+    norm = np.linalg.norm(q)
+    if norm < eps:
+        # fallback to identity rotation
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    return q / norm
+
+
+def quat_inverse(q):
+    q = safe_normalize(q)
+    q_conj = q.copy()
+    q_conj[:3] *= -1.0
+    return q_conj  # safe since unit
+
+
+def quat_multiply(q1, q2):
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+
+    return np.array([
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ], dtype=np.float32)
+
+
+def ensure_quat_continuity(q_prev, q_curr):
+    """
+    Ensures shortest path by preventing sign flips.
+    """
+    if np.dot(q_prev, q_curr) < 0:
+        return -q_curr
+    return q_curr
+    
+
+def compute_action_hybrid_rel(action_t, action_next):
+    """
+    actions: (T, 16) array
+    Returns:
+        rel_actions: (T, 16) array
+    """
+
+    rel_action = np.zeros_like(action_t)
+
+    for psm_arm in range(2):
+        base = psm_arm * 8
+
+        # --- current ---
+        p_t = action_t[base:base+3]
+        q_t = action_t[base+3:base+7]
+
+        # --- next ---
+        p_next = action_next[base:base+3]
+        q_next = action_next[base+3:base+7]
+
+        # Normalize
+        q_t = safe_normalize(q_t)
+        q_next = safe_normalize(q_next)
+
+        # Fix sign ambiguity
+        q_next = ensure_quat_continuity(q_t, q_next)
+
+        # Relative position (frame 1)
+        dp = p_next - p_t
+
+        # Relative quaternion (local frame)
+        q_inv = quat_inverse(q_t)
+        dq = quat_multiply(q_inv, q_next)
+        dq = safe_normalize(dq)
+
+        # Normalize for safety
+        dq = dq / np.linalg.norm(dq)
+
+        rel_action[base:base+3] = dp
+        rel_action[base+3:base+7] = dq
+        rel_action[base+7] = action_t[base+7]
+
+    return rel_action.astype(np.float32)
+
 
 # =============================================================================
 # DATA STRUCTURES
@@ -164,38 +244,6 @@ def load_frames_from_dir(dir_path: Path) -> List[FrameInfo]:
         except ValueError:
             continue
     return sorted(frames, key=lambda x: x.timestamp)
-
-
-def find_closest_frame(target_ts: int, frames: List[FrameInfo]) -> Optional[FrameInfo]:
-    """Find the frame with timestamp closest to target (LEGACY — kept for compatibility)"""
-    if not frames:
-        return None
-    return min(frames, key=lambda x: abs(x.timestamp - target_ts))
-
-
-def find_closest_index_fast(target_ts: int, timestamps: np.ndarray) -> int:
-    """Binary-search O(log n) lookup for closest timestamp index."""
-    idx = np.searchsorted(timestamps, target_ts)
-    if idx == 0:
-        return 0
-    if idx == len(timestamps):
-        return len(timestamps) - 1
-    if abs(timestamps[idx] - target_ts) < abs(timestamps[idx - 1] - target_ts):
-        return idx
-    return idx - 1
-
-
-def find_closest_csv_index(target_ts: int, timestamps: np.ndarray) -> int:
-    """Find the CSV row index with timestamp closest to target using binary search"""
-    idx = np.searchsorted(timestamps, target_ts)
-    if idx == 0:
-        return 0
-    if idx == len(timestamps):
-        return len(timestamps) - 1
-    if abs(timestamps[idx] - target_ts) < abs(timestamps[idx - 1] - target_ts):
-        return idx
-    return idx - 1
-
 
 def validate_episode(episode_path: Path) -> Tuple[bool, str]:
     """Validate episode structure. Returns (is_valid, error_message)"""
@@ -469,11 +517,33 @@ class ConversionWorker:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
         from lerobot.datasets.utils import write_info
 
-        if self.annotations_dir:
-            self._run_pipeline_conversion(LeRobotDataset, write_info)
-        else:
-            self._run_flat_conversion(LeRobotDataset, write_info)
+        self._run_pipeline_conversion(LeRobotDataset, write_info)
 
+    def _get_image_shapes(self, episodes: List[Path]) -> Tuple[Tuple, Tuple]:
+            """Get image shapes from the first valid episode"""
+            for episode_path in episodes:
+                left_dir = episode_path / LEFT_IMG_DIR
+                endo_dir = episode_path / ENDO_PSM1_DIR
+                
+                # Get endoscope shape
+                endo_shape = (540, 960, 3)  # default
+                left_images = list(left_dir.glob("*.jpg")) if left_dir.exists() else []
+                if left_images:
+                    img = Image.open(left_images[0])
+                    arr = np.array(img)
+                    endo_shape = arr.shape[:2] + (3,)
+                
+                # Get wrist camera shape
+                wrist_shape = (480, 640, 3)  # default
+                endo_images = list(endo_dir.glob("*.jpg")) if endo_dir.exists() else []
+                if endo_images:
+                    img = Image.open(endo_images[0])
+                    arr = np.array(img)
+                    wrist_shape = arr.shape[:2] + (3,)
+                
+                return endo_shape, wrist_shape
+            
+            return (540, 960, 3), (480, 640, 3)
     # -----------------------------------------------------------------
     # Dataset creation helpers (shared by pipeline and flat modes)
     # -----------------------------------------------------------------
@@ -512,6 +582,11 @@ class ConversionWorker:
                     "names": [STATES_NAME],
                 },
                 "action": {
+                    "dtype": "float32",
+                    "shape": (len(ACTIONS_NAME),),
+                    "names": [ACTIONS_NAME],
+                },
+                "action_hybrid_relative": {
                     "dtype": "float32",
                     "shape": (len(ACTIONS_NAME),),
                     "names": [ACTIONS_NAME],
@@ -729,144 +804,6 @@ class ConversionWorker:
         print(f"Time elapsed: {elapsed:.1f} seconds")
         print(f"Dataset saved to: {output_path}")
 
-    # -----------------------------------------------------------------
-    # Legacy flat-directory mode (no annotations)
-    # -----------------------------------------------------------------
-
-    def _run_flat_conversion(self, LeRobotDataset, write_info):
-        """Original flat-directory conversion (source/episode_xxx/...)."""
-
-        # Find all episode directories
-        episodes = sorted([d for d in self.source_path.iterdir() if d.is_dir()],
-                         key=lambda x: x.name)
-
-        if not episodes:
-            print("No episode directories found in source path", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"Found {len(episodes)} episodes to convert")
-
-        output_path = self.output_dir / self.dataset_name
-        print(f"Output path: {output_path}")
-
-        if output_path.exists():
-            print(f"Removing existing dataset at {output_path}")
-            shutil.rmtree(output_path)
-        # Also clear TEMP_IMAGE_DIR to prevent stale hardlinks from a previous run
-        if TEMP_IMAGE_DIR is not None:
-            temp_images = TEMP_IMAGE_DIR / "images"
-            if temp_images.exists():
-                shutil.rmtree(temp_images)
-                print(f"Cleared stale temp images: {temp_images}")
-        img_shape_endo, img_shape_wrist = self._get_image_shapes(episodes)
-        print(f"Endoscope image shape: {img_shape_endo}")
-        print(f"Wrist camera image shape: {img_shape_wrist}")
-        print("Creating LeRobot dataset...")
-        dataset = self._create_dataset(LeRobotDataset, img_shape_endo, img_shape_wrist)
-
-        # Process each episode
-        start_time = time.time()
-        successful_episodes = 0
-
-        # Derive a default task text from the source directory name
-        default_task_text = self.source_path.name.replace("_", " ")
-
-        for i, episode_path in enumerate(episodes):
-            if self.cancelled:
-                print("Conversion cancelled by user")
-                sys.exit(1)
-
-            print(f"\n[{i+1}/{len(episodes)}] Episode: {episode_path.name}")
-
-            # Validate episode
-            is_valid, error_msg = validate_episode(episode_path)
-            if not is_valid:
-                print(f"⚠ Skipping invalid episode {episode_path.name}: {error_msg}")
-                continue
-
-            try:
-                t_ep_start = time.time()
-                self._process_episode(dataset, episode_path, default_task_text)
-                t_proc_elapsed = time.time() - t_ep_start
-                print(
-                    f"    → Frame processing complete ({t_proc_elapsed:.1f}s). "
-                    f"Encoding videos ({VIDEO_CODEC}, parallel)..."
-                )
-                t_enc = time.time()
-                dataset.save_episode()
-                t_enc_elapsed = time.time() - t_enc
-                t_ep_total = time.time() - t_ep_start
-                successful_episodes += 1
-                print(
-                    f"✓ Episode {episode_path.name} saved — "
-                    f"processing: {t_proc_elapsed:.1f}s, encoding: {t_enc_elapsed:.1f}s, "
-                    f"total: {t_ep_total:.1f}s"
-                )
-            except Exception as e:
-                import traceback
-                error_details = traceback.format_exc()
-                print(f"✗ Error processing {episode_path.name}:\n  {error_details}", file=sys.stderr)
-                try:
-                    dataset.clear_episode_buffer()
-                except:
-                    pass  # Ignore cleanup errors
-
-        # Write splits
-        total_episodes = successful_episodes
-        if total_episodes > 0:
-            dataset.meta.info["splits"] = {
-                "train": f"0:{total_episodes}",
-                "val": "0:0",
-                "test": "0:0",
-            }
-            write_info(dataset.meta.info, dataset.root)
-            print(f"Split configuration saved (train: {total_episodes}, val: 0, test: 0)")
-
-        # Clean up ALL intermediate images at the end
-        print("Cleaning up intermediate images...")
-        self._cleanup_all_images(dataset)
-
-        elapsed = time.time() - start_time
-        print(f"\n{'='*50}")
-        print(f"Conversion complete!")
-        print(f"Total episodes: {successful_episodes}/{len(episodes)}")
-        print(f"Time elapsed: {elapsed:.1f} seconds")
-        print(f"Dataset saved to: {output_path}")
-    
-    def _get_image_shapes(self, episodes: List[Path]) -> Tuple[Tuple, Tuple]:
-        """Get image shapes from the first valid episode"""
-        for episode_path in episodes:
-            left_dir = episode_path / LEFT_IMG_DIR
-            endo_dir = episode_path / ENDO_PSM1_DIR
-            
-            # Get endoscope shape
-            endo_shape = (540, 960, 3)  # default
-            left_images = list(left_dir.glob("*.jpg")) if left_dir.exists() else []
-            if left_images:
-                img = Image.open(left_images[0])
-                arr = np.array(img)
-                endo_shape = arr.shape[:2] + (3,)
-            
-            # Get wrist camera shape
-            wrist_shape = (480, 640, 3)  # default
-            endo_images = list(endo_dir.glob("*.jpg")) if endo_dir.exists() else []
-            if endo_images:
-                img = Image.open(endo_images[0])
-                arr = np.array(img)
-                wrist_shape = arr.shape[:2] + (3,)
-            
-            return endo_shape, wrist_shape
-        
-        return (540, 960, 3), (480, 640, 3)
-    
-    @staticmethod
-    def _load_image_cv2(path: Path) -> np.ndarray:
-        """Load a JPEG image via OpenCV and return as RGB numpy array."""
-        bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise ValueError(f"Failed to read image: {path}")
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
     def _process_planned_episode(self, dataset, ref_session_dir: Path,
                                    src_session_dir: Path, start_idx: int,
                                    end_idx: int, subtask_text: str):
@@ -955,6 +892,17 @@ class ConversionWorker:
         states_matrix  = df[state_cols].values.astype(np.float32)
         actions_matrix = df[action_cols].values.astype(np.float32)
 
+        # Pre-compute hybrid relative actions for the entire CSV
+        hybrid_rel_matrix = np.zeros_like(actions_matrix)
+        for t in range(len(actions_matrix) - 1):
+            hybrid_rel_matrix[t] = compute_action_hybrid_rel(
+                actions_matrix[t], actions_matrix[t + 1]
+            )
+        # Last frame: zero-delta (identity rotation, zero translation, same jaw)
+        hybrid_rel_matrix[-1] = compute_action_hybrid_rel(
+            actions_matrix[-1], actions_matrix[-1]
+        )
+
         t_prep = time.time()
         print(
             f"  Processing {total_frames} frames "
@@ -1042,6 +990,7 @@ class ConversionWorker:
             frame = {
                 "observation.state": states_matrix[src_idx],
                 "action":            actions_matrix[src_idx],
+                "action_hybrid_relative": hybrid_rel_matrix[src_idx],
                 "instruction.text":  subtask_text,
                 "observation.meta.tool.psm1": self.psm1_tool,
                 "observation.meta.tool.psm2": self.psm2_tool,
@@ -1065,175 +1014,6 @@ class ConversionWorker:
             f"add_frame: {t_add_total:.1f}s)"
         )
 
-    def _process_episode(self, dataset, episode_path: Path, task_text: str = "default_task"):
-        """Process a single episode with strict timestamp-based synchronization.
-
-        Delegates sync + filtering to ``run_filter_episode()`` which handles:
-        1. Left-camera <-> kinematic sync with outlier removal
-        2. Vectorized multi-camera sync (all cameras within threshold)
-
-        The threshold is derived from fps: ``max_time_diff_ms = 1000 / fps``.
-
-        Optimisations preserved:
-        - Deep pipeline: 16 worker threads pre-build frame dicts ahead
-        - cv2.imread: faster JPEG decoding (releases GIL)
-        - Pre-computed state/action matrices
-        """
-        t_start = time.time()
-
-        # Derive sync threshold from fps: one frame period
-        max_time_diff_ms = self.fps
-
-        # ------------------------------------------------------------------
-        # 1. Run full sync + multi-camera filtering
-        # ------------------------------------------------------------------
-        print(
-            f"  Running strict sync (threshold={max_time_diff_ms:.1f}ms)..."
-        )
-        filt = run_filter_episode(episode_path, max_time_diff_ms)
-
-        if not filt["success"]:
-            raise ValueError(f"Sync failed: {filt.get('error', 'Unknown')}")
-
-        valid_left_filenames = filt["valid_left_filenames"]
-        kinematics_indices  = filt["kinematics_indices"]
-        secondary_indices   = filt["secondary_camera_indices"]
-
-        print(
-            f"  Sync complete: {filt['num_valid']} synced frames "
-            f"({filt['outliers_removed']} kinematic outliers, "
-            f"{filt['multicam_dropped']} camera mismatches removed)"
-        )
-
-        t_sync = time.time()
-
-        # ------------------------------------------------------------------
-        # 2. Load frame lists and map filenames to paths
-        # ------------------------------------------------------------------
-        left_frames  = load_frames_from_dir(episode_path / LEFT_IMG_DIR)
-        right_frames = load_frames_from_dir(episode_path / RIGHT_IMG_DIR)
-        psm1_frames  = load_frames_from_dir(episode_path / ENDO_PSM1_DIR)
-        psm2_frames  = load_frames_from_dir(episode_path / ENDO_PSM2_DIR)
-
-        if not left_frames:
-            raise ValueError("No frames in left_img_dir")
-
-        # Map valid left filenames -> indices in left_frames
-        left_fname_to_idx = {f.path.name: i for i, f in enumerate(left_frames)}
-        final_left_indices = np.array(
-            [left_fname_to_idx[fn] for fn in valid_left_filenames],
-            dtype=np.int64,
-        )
-
-        # ------------------------------------------------------------------
-        # 3. Load CSV & pre-compute state/action matrices
-        # ------------------------------------------------------------------
-        csv_path = episode_path / CSV_FILE
-        df = pd.read_csv(csv_path)
-
-        state_cols  = [c for c in STATES_NAME  if c in df.columns]
-        action_cols = [c for c in ACTIONS_NAME if c in df.columns]
-        states_matrix  = df[state_cols].values.astype(np.float32)
-        actions_matrix = df[action_cols].values.astype(np.float32)
-
-        t_prep = time.time()
-
-        total_frames = len(final_left_indices)
-        print(
-            f"  Processing {total_frames} synchronized frames "
-            f"(sync: {t_sync - t_start:.1f}s, prep: {t_prep - t_sync:.1f}s)..."
-        )
-
-        # ------------------------------------------------------------------
-        # 4. Pipelined frame processing
-        #    16 workers pre-build frame dicts (image loading + dict assembly)
-        #    while the main thread just calls add_frame().
-        # ------------------------------------------------------------------
-        PIPELINE_DEPTH = 64
-        NUM_WORKERS = 16
-
-        fps_inv = 1.0 / self.fps
-        t_add_total = 0.0
-
-        # Pre-build path lists for fast indexing
-        left_paths  = [f.path for f in left_frames]
-        right_paths = [f.path for f in right_frames] if right_frames else None
-        psm1_paths  = [f.path for f in psm1_frames] if psm1_frames else None
-        psm2_paths  = [f.path for f in psm2_frames] if psm2_frames else None
-
-        # Secondary camera index arrays (already final from run_filter_episode)
-        right_idx_arr = secondary_indices.get("right_img_dir")
-        psm1_idx_arr  = secondary_indices.get("endo_psm1")
-        psm2_idx_arr  = secondary_indices.get("endo_psm2")
-
-        def _build_frame(out_idx):
-            """Build a complete frame dict -- runs in worker thread.
-            cv2.imread releases the GIL so threads truly run in parallel."""
-            left_idx = final_left_indices[out_idx]
-            csv_idx  = kinematics_indices[out_idx]
-
-            left_img = self._load_image_cv2(left_paths[left_idx])
-
-            frame = {
-                "observation.state": states_matrix[csv_idx],
-                "action": actions_matrix[csv_idx],
-                "instruction.text": task_text,
-                "observation.meta.tool.psm1": self.psm1_tool,
-                "observation.meta.tool.psm2": self.psm2_tool,
-                "observation.images.endoscope.left": left_img,
-            }
-
-            if right_idx_arr is not None and right_paths:
-                frame["observation.images.endoscope.right"] = self._load_image_cv2(
-                    right_paths[right_idx_arr[out_idx]]
-                )
-            if psm1_idx_arr is not None and psm1_paths:
-                frame["observation.images.wrist.right"] = self._load_image_cv2(
-                    psm1_paths[psm1_idx_arr[out_idx]]
-                )
-            if psm2_idx_arr is not None and psm2_paths:
-                frame["observation.images.wrist.left"] = self._load_image_cv2(
-                    psm2_paths[psm2_idx_arr[out_idx]]
-                )
-            return frame
-
-        pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
-
-        # Seed the pipeline with initial batch of futures
-        futures = {}
-        for i in range(min(PIPELINE_DEPTH, total_frames)):
-            futures[i] = pool.submit(_build_frame, i)
-
-        for frame_idx in range(total_frames):
-            # Progress every 500 frames
-            if frame_idx > 0 and frame_idx % 500 == 0:
-                avg_add = (t_add_total / frame_idx) * 1000
-                print(
-                    f"    -> {frame_idx}/{total_frames} "
-                    f"(avg add_frame={avg_add:.1f}ms)"
-                )
-
-            frame = futures.pop(frame_idx).result()
-
-            next_idx = frame_idx + PIPELINE_DEPTH
-            if next_idx < total_frames:
-                futures[next_idx] = pool.submit(_build_frame, next_idx)
-
-            t0 = time.time()
-            dataset.add_frame(frame, task=task_text, timestamp=frame_idx * fps_inv)
-            t_add_total += time.time() - t0
-
-        pool.shutdown(wait=False)
-
-        t_end = time.time()
-        print(
-            f"    -> {total_frames}/{total_frames} frames processed (100%) "
-            f"| total: {t_end - t_start:.1f}s "
-            f"(sync: {t_sync - t_start:.1f}s, "
-            f"prep: {t_prep - t_sync:.1f}s, "
-            f"add_frame: {t_add_total:.1f}s, "
-            f"pipeline overhead: {(t_end - t_prep) - t_add_total:.1f}s)"
-        )
     
     def _cleanup_all_images(self, dataset):
         """Remove ALL intermediate images after all video encoding is complete"""
@@ -1245,7 +1025,6 @@ class ConversionWorker:
                     print(f"  Cleaned up: {images_dir}")
             except Exception as e:
                 print(f"  Warning: Could not clean up {images_dir}: {str(e)}", file=sys.stderr)
-
 
 # =============================================================================
 # MAIN
