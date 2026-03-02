@@ -9,6 +9,9 @@ Based on dvrk_zarr_to_lerobot.py but with:
 - Support for new DVRK data format (timestamp-based filenames)
 - All episodes go to training set
 - CLI arguments for ease of use
+
+python dvrk_lerobot_converter_v2.1.py --source-dir <insert_path_to_dvrk_data> --annotations-dir <insert_path_to_annotations> \
+ --dataset-name <insert_dataset_name> --overwrite
 """
 
 import sys
