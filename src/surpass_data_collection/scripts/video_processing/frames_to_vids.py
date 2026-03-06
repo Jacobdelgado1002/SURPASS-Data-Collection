@@ -6,22 +6,20 @@ Traverse a 'cautery' folder structure and convert images in camera folders
 (endo_psm1, endo_psm2, left_img_dir, right_img_dir) into videos (one per camera/run).
 
 This script processes medical imaging data organized in a hierarchical folder structure:
-    cautery/
-        cautery_tissue_001/
-            run_001/
-                endo_psm1/
-                    frame_0001.png
-                    frame_0002.png
-                    ...
-                endo_psm2/
-                left_img_dir/
-                right_img_dir/
+    Cholecystectomy/
+        SubjectName/
+            Tissue#1/
+                20260304-175158-967720/
+                    left_img_dir/
+                        frame_0001.png
+                        frame_0002.png
+                        ...
 
 The script will:
-    1. Traverse all cautery_tissue* directories
-    2. Process each run within tissue directories
-    3. Convert image sequences from each camera folder into MP4 videos
-    4. Maintain the original folder structure in the output directory
+    1. Traverse all subject directories
+    2. Traverse all tissue directories within each subject
+    3. Process each run within tissue directories
+    4. Convert image sequences from left_img_dir into sequentially named MP4 videos (Cholecystectomy_tissue######.mp4)
     5. Handle missing frames and resizing automatically
 
 Usage:
@@ -49,6 +47,7 @@ Notes:
 """
 
 import argparse
+import concurrent.futures
 import os
 import re
 import sys
@@ -57,14 +56,14 @@ from typing import List, Optional, Tuple
 
 import cv2
 
-from logger_config import get_logger
+from surpass_data_collection.logger_config import get_logger
 
 # ---------------------------------------------------------------------
 # Module constants
 # ---------------------------------------------------------------------
 
-# Supported camera folder names in the expected directory structure
-CAM_LIST: Tuple[str, ...] = ("endo_psm1", "endo_psm2", "left_img_dir", "right_img_dir")
+# Supported camera folder names in the expected directory structure (only left_img_dir required now)
+CAM_LIST: Tuple[str, ...] = ("left_img_dir",)
 
 # File extensions to skip when collecting images
 SKIP_EXTENSIONS: Tuple[str, ...] = (".csv", ".txt", ".json", ".xml")
@@ -81,8 +80,8 @@ SKIP_WARNING_INTERVAL: int = 50
 
 # Default video parameters
 DEFAULT_FPS: int = 30
-DEFAULT_ROOT_DIR: str = "cautery"
-DEFAULT_OUT_DIR: str = "videos"
+DEFAULT_ROOT_DIR: str = r"D:\Data\Cholecystectomy"
+DEFAULT_OUT_DIR: str = "Cholecystectomy_videos"
 
 # Initialize module logger
 logger = get_logger(__name__)
@@ -92,6 +91,8 @@ logger = get_logger(__name__)
 # Utility Functions
 # ---------------------------------------------------------------------
 
+
+_DIGIT_SPLIT_RE = re.compile(r"(\d+)")
 
 def natural_key(s: str) -> List:
     """
@@ -109,7 +110,7 @@ def natural_key(s: str) -> List:
         List of alternating integers and strings suitable for sorting.
         Example: "frame10" -> ["frame", 10, ""]
     """
-    parts: List[str] = re.split(r"(\d+)", s)
+    parts: List[str] = _DIGIT_SPLIT_RE.split(s)
     key: List = []
     for p in parts:
         key.append(int(p) if p.isdigit() else p.lower())
@@ -144,19 +145,22 @@ def collect_image_files(img_dir: str) -> List[str]:
     """
     entries: List[str] = []
     
-    # Iterate over all entries in the directory
-    for name in os.listdir(img_dir):
-        full_path: str = os.path.join(img_dir, name)
-        
-        # Skip directories - we only want files
-        if not os.path.isfile(full_path):
-            continue
-        
-        # Skip non-image files by extension
-        if any(name.lower().endswith(ext) for ext in SKIP_EXTENSIONS):
-            continue
-        
-        entries.append(full_path)
+    try:
+        with os.scandir(img_dir) as it:
+            for entry in it:
+                # Skip directories - we only want files
+                if not entry.is_file():
+                    continue
+                
+                # Skip non-image files by extension
+                name = entry.name
+                if any(name.lower().endswith(ext) for ext in SKIP_EXTENSIONS):
+                    continue
+                
+                entries.append(entry.path)
+    except OSError as e:
+        logger.error(f"Failed to scan {img_dir}: {e}")
+        return []
 
     # Sort based on natural ordering of the basename
     # This ensures frame_1, frame_2, ..., frame_10, frame_11 order
@@ -217,7 +221,7 @@ def choose_writer(
     )
     
     if writer.isOpened():
-        logger.info(f"Using fallback {FALLBACK_CODEC} codec, output: {fallback_path}")
+        print(f"Using fallback {FALLBACK_CODEC} codec, output: {fallback_path}")
         return writer, fallback_path
 
     # Both attempts failed
@@ -324,7 +328,7 @@ def process_camera_run(img_dir: str, out_video_path: str, fps: int) -> None:
         - Video writer is always released, even if errors occur
         - Empty directories or directories with no readable images are skipped
     """
-    logger.info(f"Processing camera run: {img_dir}")
+    print(f"Processing camera run: {img_dir}")
     
     # Collect all image files in natural order
     files: List[str] = collect_image_files(img_dir)
@@ -333,7 +337,7 @@ def process_camera_run(img_dir: str, out_video_path: str, fps: int) -> None:
         logger.warning(f"No image files found in {img_dir} — skipping")
         return
 
-    logger.info(f"Found {len(files)} potential image files")
+    print(f"Found {len(files)} potential image files")
 
     # Find the first readable image to determine frame size
     first_img, first_idx, frame_size = find_first_readable_image(files)
@@ -342,10 +346,10 @@ def process_camera_run(img_dir: str, out_video_path: str, fps: int) -> None:
         logger.error(f"No readable images found in {img_dir}. Skipping camera run.")
         return
 
-    logger.info(
-        f"Reference frame: {os.path.basename(files[first_idx])}, "
-        f"size: {frame_size[0]}x{frame_size[1]}"
-    )
+    # print(
+    #     f"Reference frame: {os.path.basename(files[first_idx])}, "
+    #     f"size: {frame_size[0]}x{frame_size[1]}"
+    # )
 
     # Ensure parent directory exists for video output
     output_parent: Path = Path(out_video_path).parent
@@ -359,7 +363,7 @@ def process_camera_run(img_dir: str, out_video_path: str, fps: int) -> None:
         logger.error(f"Could not open VideoWriter for {out_video_path}. Skipping.")
         return
 
-    logger.info(f"Writing video to: {actual_out}")
+    print(f"Writing video to: {actual_out}")
     
     written: int = 0
     skipped: int = 0
@@ -391,9 +395,9 @@ def process_camera_run(img_dir: str, out_video_path: str, fps: int) -> None:
             writer.write(img)
             written += 1
 
-            # Periodic progress update
+            # Periodic progress update (downgraded to debug for parallel mode)
             if written % PROGRESS_INTERVAL == 0:
-                logger.info(f"Progress: {written}/{len(files)} frames written")
+                logger.debug(f"Progress ({os.path.basename(out_video_path)}): {written}/{len(files)} frames written")
 
     finally:
         # Always release the writer, even if an error occurred
@@ -401,7 +405,7 @@ def process_camera_run(img_dir: str, out_video_path: str, fps: int) -> None:
         logger.debug("Released VideoWriter")
 
     # Final summary
-    logger.info(
+    print(
         f"Completed: {written} frames written, {skipped} frames skipped. "
         f"Output: {actual_out}"
     )
@@ -422,75 +426,63 @@ def validate_root_directory(root_dir: str) -> bool:
         logger.error(f"Root directory '{root_dir}' not found or is not a directory")
         return False
     
-    logger.info(f"Validated root directory: {root_dir}")
+    print(f"Validated root directory: {root_dir}")
     return True
 
 
-def find_tissue_directories(root_dir: str) -> List[str]:
+def find_subject_directories(root_dir: str) -> List[str]:
     """
-    Find all cautery_tissue* directories in the root directory.
+    Find all subject directories in the root directory.
 
     Args:
         root_dir: Path to the root directory to search.
 
     Returns:
-        Sorted list of full paths to tissue directories.
+        Sorted list of full paths to subject directories.
         Empty list if no matching directories found.
 
     Notes:
-        - Only directories starting with "cautery_tissue" are included
         - Results are sorted alphabetically
         - Subdirectories are not traversed
     """
-    tissue_dirs: List[str] = sorted(
-        [
-            os.path.join(root_dir, d)
-            for d in os.listdir(root_dir)
-            if os.path.isdir(os.path.join(root_dir, d)) and d.startswith("cautery_tissue")
-        ]
-    )
-    
-    logger.info(f"Found {len(tissue_dirs)} tissue directories")
-    return tissue_dirs
-
-
-def process_run_directory(
-    run_dir: str, root_dir: str, out_dir: str, fps: int, overwrite: bool
-) -> None:
-    """
-    Process all camera folders within a single run directory.
-
-    Args:
-        run_dir: Path to the run directory containing camera folders.
-        root_dir: Original root directory (for calculating relative paths).
-        out_dir: Output directory for videos.
-        fps: Frames per second for videos.
-        overwrite: Whether to overwrite existing videos.
-    """
-    logger.info(f"Processing run directory: {run_dir}")
-    
-    for cam in CAM_LIST:
-        img_dir: str = os.path.join(run_dir, cam)
+    subject_dirs: List[str] = []
+    try:
+        with os.scandir(root_dir) as it:
+            for entry in it:
+                if entry.is_dir():
+                    subject_dirs.append(entry.path)
+    except OSError as e:
+        logger.error(f"Failed to scan {root_dir}: {e}")
         
-        # Skip if camera folder doesn't exist
-        if not os.path.isdir(img_dir):
-            logger.debug(f"Camera folder not found, skipping: {img_dir}")
-            continue
+    subject_dirs.sort()
+    print(f"Found {len(subject_dirs)} subject directories")
+    return subject_dirs
 
-        # Preserve relative structure under output directory
-        rel_path: str = os.path.relpath(run_dir, root_dir)
-        out_video: str = os.path.join(out_dir, rel_path, f"{cam}.mp4")
 
-        # Skip if output exists and overwrite not enabled
-        if os.path.exists(out_video) and not overwrite:
-            logger.info(f"Skipping existing video (use --overwrite to replace): {out_video}")
-            continue
-
-        # Process this camera folder
-        try:
-            process_camera_run(img_dir, out_video, fps)
-        except Exception as e:
-            logger.error(f"Error processing {img_dir}: {e}", exc_info=True)
+def get_next_video_index(out_dir: str) -> int:
+    """
+    Scan the output directory to find the highest existing video sequence number.
+    Returns the next available index.
+    """
+    if not os.path.exists(out_dir):
+        return 0
+        
+    pattern = re.compile(r"Cholecystectomy_tissue(\d{6})\.mp4")
+    max_idx = -1
+    
+    try:
+        with os.scandir(out_dir) as it:
+            for entry in it:
+                if entry.is_file():
+                    match = pattern.match(entry.name)
+                    if match:
+                        idx = int(match.group(1))
+                        if idx > max_idx:
+                            max_idx = idx
+    except OSError:
+        pass
+                
+    return max_idx + 1
 
 
 # ---------------------------------------------------------------------
@@ -505,13 +497,14 @@ def main() -> None:
     Parses command-line arguments, validates inputs, and orchestrates
     the processing pipeline:
         1. Validate root directory
-        2. Find all tissue directories
-        3. For each tissue directory, find all run directories
-        4. For each run, process all camera folders
-        5. Convert image sequences to videos
+        2. Find all subject directories
+        3. For each subject directory, find all tissue directories
+        4. For each tissue directory, find all run directories
+        5. For each run, process all camera folders
+        6. Convert image sequences to videos
 
     Command-line Arguments:
-        --root_dir: Root directory containing cautery_tissue* folders
+        --root_dir: Root directory containing subject folders
                    (default: "cautery")
         --fps: Frames per second for output videos (default: 30)
         --out_dir: Directory to save output videos (default: "videos")
@@ -520,7 +513,7 @@ def main() -> None:
 
     Exit Codes:
         0: Success (all processing completed)
-        1: No tissue directories found
+        1: No subject directories found
         2: Root directory not found or invalid
 
     Examples:
@@ -591,76 +584,94 @@ def main() -> None:
     overwrite: bool = args.overwrite
 
     # Log configuration
-    logger.info("=" * 70)
-    logger.info("Starting frames-to-video conversion")
-    logger.info(f"Root directory: {root_dir}")
-    logger.info(f"Output directory: {out_dir}")
-    logger.info(f"FPS: {fps}")
-    logger.info(f"Dry run: {dry_run}")
-    logger.info(f"Overwrite: {overwrite}")
-    logger.info("=" * 70)
+    print("=" * 70)
+    print("Starting frames-to-video conversion")
+    print(f"Root directory: {root_dir}")
+    print(f"Output directory: {out_dir}")
+    print(f"FPS: {fps}")
+    print(f"Dry run: {dry_run}")
+    print(f"Overwrite: {overwrite}")
+    print("=" * 70)
 
     # Validate root directory exists
     if not validate_root_directory(root_dir):
         sys.exit(2)
 
-    # Find all tissue directories
-    tissue_dirs: List[str] = find_tissue_directories(root_dir)
+    # Find all subject directories
+    subject_dirs: List[str] = find_subject_directories(root_dir)
 
-    if not tissue_dirs:
-        logger.error(f"No 'cautery_tissue*' directories found in {root_dir}")
+    if not subject_dirs:
+        logger.error(f"No subject directories found in {root_dir}")
         sys.exit(1)
+
+    # Ensure output directory exists to scan for next index
+    os.makedirs(out_dir, exist_ok=True)
+    next_video_index = get_next_video_index(out_dir)
+    print(f"Starting video index for new outputs: {next_video_index:06d}")
+
+    # Collect all tasks (runs) to process
+    tasks: List[Tuple[str, str, int]] = []
+    
+    for subject in subject_dirs:
+        try:
+            with os.scandir(subject) as it:
+                tissue_dirs = sorted([e.path for e in it if e.is_dir()])
+        except OSError:
+            continue
+            
+        for tissue in tissue_dirs:
+            try:
+                with os.scandir(tissue) as it:
+                    run_dirs = sorted([e.path for e in it if e.is_dir()])
+            except OSError:
+                continue
+                
+            for run in run_dirs:
+                for cam in CAM_LIST:
+                    img_dir = os.path.join(run, cam)
+                    if os.path.isdir(img_dir):
+                        out_video = os.path.join(out_dir, f"Cholecystectomy_tissue{next_video_index:06d}.mp4")
+                        if not os.path.exists(out_video) or overwrite:
+                            tasks.append((img_dir, out_video, fps))
+                        else:
+                            print(f"Skipping existing video (use --overwrite to replace): {out_video}")
+                        next_video_index += 1
 
     # Dry run mode - just list what would be processed
     if dry_run:
-        logger.info("DRY RUN MODE - No videos will be created")
-        for tissue in tissue_dirs:
-            logger.info(f"Would process tissue directory: {tissue}")
-            run_dirs: List[str] = sorted(
-                [
-                    os.path.join(tissue, r)
-                    for r in os.listdir(tissue)
-                    if os.path.isdir(os.path.join(tissue, r))
-                ]
-            )
-            for run in run_dirs:
-                logger.info(f"  Would process run: {run}")
-                for cam in CAM_LIST:
-                    img_dir: str = os.path.join(run, cam)
-                    if os.path.isdir(img_dir):
-                        logger.info(f"    Would process camera: {cam}")
+        print("DRY RUN MODE - No videos will be created")
+        for img_dir, out_video, _ in tasks:
+            print(f"Would process camera run: {os.path.basename(os.path.dirname(img_dir))} -> {os.path.basename(out_video)}")
         return
 
-    # Process each tissue directory
-    total_runs: int = 0
-    for tissue in tissue_dirs:
-        logger.info(f"\n{'=' * 70}")
-        logger.info(f"Processing tissue directory: {os.path.basename(tissue)}")
-        logger.info(f"{'=' * 70}")
+    print(f"Found {len(tasks)} videos to process")
+    
+    max_workers = os.cpu_count() or 4
+    print(f"Processing with up to {max_workers} threads in parallel")
+    
+    # Process tasks concurrently using ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_camera_run, img_dir, out_video, v_fps): out_video for img_dir, out_video, v_fps in tasks}
         
-        # Find all run directories within this tissue directory
-        run_dirs: List[str] = sorted(
-            [
-                os.path.join(tissue, r)
-                for r in os.listdir(tissue)
-                if os.path.isdir(os.path.join(tissue, r))
-            ]
-        )
-
-        logger.info(f"Found {len(run_dirs)} run directories")
-
-        # Process each run directory
-        for run in run_dirs:
-            total_runs += 1
-            process_run_directory(run, root_dir, out_dir, fps, overwrite)
+        completed = 0
+        total = len(tasks)
+        
+        # Wait for all to complete
+        for future in concurrent.futures.as_completed(futures):
+            completed += 1
+            out_video = futures[future]
+            try:
+                future.result()
+                print(f"[{completed}/{total}] Created video: {os.path.basename(out_video)}")
+            except Exception as e:
+                logger.error(f"[{completed}/{total}] Error creating {os.path.basename(out_video)}: {e}", exc_info=True)
 
     # Final summary
-    logger.info("\n" + "=" * 70)
-    logger.info("Processing complete!")
-    logger.info(f"Processed {len(tissue_dirs)} tissue directories")
-    logger.info(f"Processed {total_runs} run directories")
-    logger.info(f"Output location: {out_dir}")
-    logger.info("=" * 70)
+    print("\n" + "=" * 70)
+    print("Processing complete!")
+    print(f"Total videos created: {completed}/{total}")
+    print(f"Output location: {out_dir}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
