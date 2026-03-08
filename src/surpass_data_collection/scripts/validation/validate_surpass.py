@@ -124,6 +124,15 @@ ACTION_DIM: int = 16
 # PSM1: indices 3-6, PSM2: indices 11-14
 QUAT_SLICES: List[slice] = [slice(3, 7), slice(11, 15)]
 
+# Jaw angle indices within the 16-dim state vector (index 7 = psm1_jaw, 15 = psm2_jaw)
+JAW_INDICES: List[int] = [7, 15]
+# Typical dVRK PSM jaw physical limits in radians, with generous tolerance
+JAW_MIN_RAD: float = -0.7
+JAW_MAX_RAD: float = 1.5
+
+# Timestamp spacing tolerance: flag if any gap exceeds 5x the expected 1/FPS interval
+TIMESTAMP_GAP_FACTOR: float = 5.0
+
 EXPECTED_FEATURES: Dict[str, Dict[str, Any]] = {
     "observation.images.endoscope.left": {"dtype": "video"},
     "observation.images.endoscope.right": {"dtype": "video"},
@@ -429,7 +438,11 @@ class SurpassDatasetValidator:
             self._check_single_video(vpath)
 
     def _check_single_video(self, video_path: Path) -> None:
-        """Open a single video and check FPS, resolution, and frame count.
+        """Open a single video: check FPS, resolution, frame count, and last-frame decode.
+
+        Seeking directly to the last frame and attempting a decode catches
+        truncated or corrupted MP4 files that would otherwise pass a
+        header-only check.
 
         Args:
             video_path: Path to an .mp4 file.
@@ -441,20 +454,36 @@ class SurpassDatasetValidator:
             if not cap.isOpened():
                 self._add(ValidationLevel.ERROR, cat, f"Cannot open {rel}")
                 return
+
             fps = cap.get(cv2.CAP_PROP_FPS)
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
 
             if n_frames == 0:
+                cap.release()
                 self._add(ValidationLevel.ERROR, cat, f"{rel} has 0 frames")
-            elif fps < MIN_FPS:
+                return
+
+            # Deep integrity: seek to last frame and attempt decode
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, n_frames - 1))
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret or frame is None:
+                self._add(
+                    ValidationLevel.ERROR, cat,
+                    f"{rel} last-frame decode FAILED (truncated/corrupted)",
+                )
+                return
+
+            # Standard metadata checks
+            if fps < MIN_FPS:
                 self._add(ValidationLevel.WARNING, cat, f"{rel} FPS={fps:.1f} < {MIN_FPS}")
             elif h < MIN_RESOLUTION[0] or w < MIN_RESOLUTION[1]:
-                self._add(ValidationLevel.WARNING, cat, f"{rel} resolution {w}×{h} below {MIN_RESOLUTION}")
+                self._add(ValidationLevel.WARNING, cat, f"{rel} resolution {w}x{h} below {MIN_RESOLUTION}")
             else:
-                self._add(ValidationLevel.SUCCESS, cat, f"{rel}: {w}×{h} @ {fps:.0f}fps, {n_frames} frames")
+                self._add(ValidationLevel.SUCCESS, cat, f"{rel}: {w}x{h} @ {fps:.0f}fps, {n_frames} frames (last-frame OK)")
         except Exception as exc:
             self._add(ValidationLevel.ERROR, cat, f"Error reading {rel}: {exc}")
 
@@ -520,7 +549,7 @@ class SurpassDatasetValidator:
     # ------------------------------------------------------------------
 
     def validate_data_quality(self) -> None:
-        """Sample parquet files and check for NaN/Inf, quaternion norms, action std, and episode lengths."""
+        """Sample parquet files and check for NaN/Inf, quaternion norms, action std, episode lengths, timestamps, indexing, and jaw bounds."""
         cat = "Data Quality"
 
         data_dir = self.dataset_path / "data"
@@ -531,6 +560,19 @@ class SurpassDatasetValidator:
         if not parquets:
             return
 
+        # Read FPS from info.json for timestamp spacing check
+        expected_dt: Optional[float] = None
+        info_path = self.dataset_path / "meta" / "info.json"
+        if info_path.exists():
+            try:
+                with open(info_path, "r", encoding="utf-8") as f:
+                    info_data = json.load(f)
+                fps_val = info_data.get("fps")
+                if fps_val and fps_val > 0:
+                    expected_dt = 1.0 / fps_val
+            except Exception:
+                pass
+
         # Sample up to 10 parquets distributed across the dataset
         step = max(1, len(parquets) // 10)
         sample_paths = parquets[::step]
@@ -540,6 +582,10 @@ class SurpassDatasetValidator:
         episode_lengths: List[int] = []
         nan_inf_episodes: List[str] = []
         quat_bad_episodes: List[str] = []
+        ts_non_mono_episodes: List[str] = []
+        ts_gap_episodes: List[str] = []
+        idx_bad_episodes: List[str] = []
+        jaw_bad_episodes: List[str] = []
 
         for ppath in sample_paths:
             try:
@@ -552,10 +598,6 @@ class SurpassDatasetValidator:
             ep_label = ppath.stem
 
             # --- Extract state and action columns ---
-            state_cols = [c for c in df.columns if c.startswith("observation.state")]
-            action_cols = [c for c in df.columns if c == "action" or c.startswith("action.")]
-
-            # Try to get the state/action arrays
             state_arr = self._extract_tensor_column(df, "observation.state", STATE_DIM)
             action_arr = self._extract_tensor_column(df, "action", ACTION_DIM)
 
@@ -582,6 +624,49 @@ class SurpassDatasetValidator:
                         pct = 100.0 * bad_mask.sum() / len(norms)
                         quat_bad_episodes.append(f"{ep_label}({pct:.1f}%)")
 
+            # --- Jaw physical bounds check ---
+            if state_arr is not None:
+                for ji in JAW_INDICES:
+                    jaw_vals = state_arr[:, ji]
+                    oob_mask = (jaw_vals < JAW_MIN_RAD) | (jaw_vals > JAW_MAX_RAD)
+                    if np.any(oob_mask):
+                        n_oob = int(oob_mask.sum())
+                        jaw_bad_episodes.append(
+                            f"{ep_label}(col={ji}, {n_oob} frames)"
+                        )
+
+            # --- Timestamp monotonicity and spacing ---
+            if "timestamp" in df.columns and len(df) > 1:
+                ts_vals = df["timestamp"].values.astype(np.float64)
+                diffs = np.diff(ts_vals)
+
+                # Monotonicity: every diff must be > 0
+                if np.any(diffs <= 0):
+                    n_bad = int(np.sum(diffs <= 0))
+                    ts_non_mono_episodes.append(f"{ep_label}({n_bad} reversals)")
+
+                # Spacing: flag large gaps (> TIMESTAMP_GAP_FACTOR * expected_dt)
+                if expected_dt is not None:
+                    max_gap = float(np.max(diffs))
+                    if max_gap > TIMESTAMP_GAP_FACTOR * expected_dt:
+                        ts_gap_episodes.append(
+                            f"{ep_label}(max gap={max_gap:.4f}s, expected ~{expected_dt:.4f}s)"
+                        )
+
+            # --- Parquet index integrity ---
+            if "frame_index" in df.columns:
+                frame_idx = df["frame_index"].values
+                expected_seq = np.arange(len(frame_idx))
+                if not np.array_equal(frame_idx, expected_seq):
+                    idx_bad_episodes.append(f"{ep_label}(frame_index)")
+
+            if "episode_index" in df.columns:
+                ep_idx_vals = df["episode_index"].values
+                if not np.all(ep_idx_vals == ep_idx_vals[0]):
+                    idx_bad_episodes.append(f"{ep_label}(episode_index not constant)")
+
+        # ===================== Aggregate reports =====================
+
         # --- Report NaN/Inf ---
         if nan_inf_episodes:
             self._add(
@@ -596,10 +681,53 @@ class SurpassDatasetValidator:
         if quat_bad_episodes:
             self._add(
                 ValidationLevel.WARNING, cat,
-                f"Quaternion norm ≠ 1.0 (±{QUAT_NORM_TOL}) in: {', '.join(quat_bad_episodes[:5])}",
+                f"Quaternion norm != 1.0 (+/-{QUAT_NORM_TOL}) in: {', '.join(quat_bad_episodes[:5])}",
             )
         else:
-            self._add(ValidationLevel.SUCCESS, cat, "Quaternion norms ≈ 1.0 in sampled episodes")
+            self._add(ValidationLevel.SUCCESS, cat, "Quaternion norms ~ 1.0 in sampled episodes")
+
+        # --- Report jaw bounds ---
+        if jaw_bad_episodes:
+            self._add(
+                ValidationLevel.WARNING, cat,
+                f"Jaw angle outside physical range [{JAW_MIN_RAD}, {JAW_MAX_RAD}] rad in: "
+                f"{', '.join(jaw_bad_episodes[:5])}",
+                "Possible encoder glitch or unit mismatch",
+            )
+        else:
+            self._add(
+                ValidationLevel.SUCCESS, cat,
+                f"Jaw angles within physical bounds in {len(sample_paths)} sampled episode(s)",
+            )
+
+        # --- Report timestamp monotonicity ---
+        if ts_non_mono_episodes:
+            self._add(
+                ValidationLevel.ERROR, cat,
+                f"Timestamps are NOT monotonically increasing in: {', '.join(ts_non_mono_episodes[:5])}",
+            )
+        else:
+            self._add(ValidationLevel.SUCCESS, cat, "Timestamps monotonically increasing in sampled episodes")
+
+        # --- Report timestamp gaps ---
+        if ts_gap_episodes:
+            self._add(
+                ValidationLevel.WARNING, cat,
+                f"Large timestamp gaps (>{TIMESTAMP_GAP_FACTOR}x expected) in: {', '.join(ts_gap_episodes[:5])}",
+                "Possible dropped frames during data collection",
+            )
+        elif expected_dt is not None:
+            self._add(ValidationLevel.SUCCESS, cat, "Timestamp spacing consistent with FPS in sampled episodes")
+
+        # --- Report index integrity ---
+        if idx_bad_episodes:
+            self._add(
+                ValidationLevel.ERROR, cat,
+                f"Index integrity violation in: {', '.join(idx_bad_episodes[:5])}",
+                "frame_index must start at 0 and increment by 1; episode_index must be constant",
+            )
+        else:
+            self._add(ValidationLevel.SUCCESS, cat, "Parquet frame/episode indices valid in sampled episodes")
 
         # --- Report action std ---
         if all_actions:
@@ -610,7 +738,7 @@ class SurpassDatasetValidator:
             if overall_std < 1e-6:
                 self._add(
                     ValidationLevel.WARNING, cat,
-                    f"Action std is near zero ({overall_std:.2e}) — stationary trimming may not have worked",
+                    f"Action std is near zero ({overall_std:.2e}) -- stationary trimming may not have worked",
                 )
             elif zero_dims > 0:
                 self._add(
