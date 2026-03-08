@@ -56,6 +56,7 @@ if _POST_PROCESSING_DIR not in sys.path:
 
 from filter_episodes import run_filter_episode, run_filter_episodes
 from slice_affordance import plan_episodes, list_sorted_frames, extract_timestamp as sa_extract_timestamp
+from remove_stationary_frames import compute_deltas, find_trim_range, MOTION_COLUMNS
 
 # Default LeRobot home for UI display only
 DEFAULT_LEROBOT_HOME = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "lerobot")
@@ -476,7 +477,8 @@ class ConversionWorker:
     
     def __init__(self, source_path: Path, output_dir: Path, dataset_name: str,
                  psm1_tool: str, psm2_tool: str, fps: int,
-                 annotations_dir: Optional[Path] = None):
+                 annotations_dir: Optional[Path] = None,
+                 trim_threshold: float = 1e-4):
         self.source_path = source_path
         self.output_dir = output_dir
         self.dataset_name = dataset_name
@@ -484,6 +486,7 @@ class ConversionWorker:
         self.psm2_tool = psm2_tool
         self.fps = fps
         self.annotations_dir = annotations_dir
+        self.trim_threshold = trim_threshold
         self.cancelled = False
     
     def cancel(self, signum=None, frame=None):
@@ -620,8 +623,73 @@ class ConversionWorker:
 
 
     # -----------------------------------------------------------------
-    # Pipeline mode: filter → plan → convert
+    # Pipeline mode: filter → plan → (trim) → convert
     # -----------------------------------------------------------------
+
+    def _trim_stationary_episodes(self, planned):
+        """Adjust planned episode indices to remove stationary head/tail.
+
+        Groups episodes by reference session to load each CSV only once.
+        Returns (trimmed_planned, stats_dict).
+        """
+        from collections import defaultdict
+        import csv as csv_mod
+
+        # Group episode indices by ref_session_dir
+        groups = defaultdict(list)  # ref_dir → [(list_index, start, end), ...]
+        for i, (ann, ref, src, dst, start, end) in enumerate(planned):
+            groups[ref].append((i, start, end))
+
+        trimmed_planned = list(planned)  # shallow copy of the list
+        stats = {"total": len(planned), "trimmed": 0, "frames_removed": 0}
+
+        for ref_dir, episodes_in_session in groups.items():
+            csv_path = ref_dir / CSV_FILE
+            if not csv_path.exists():
+                continue
+
+            # Load CSV and compute deltas using optimized pandas engine
+            try:
+                full_deltas, _ = compute_deltas(csv_path)
+                if full_deltas is None:
+                    continue
+            except Exception as e:
+                print(f"  Warning: could not compute deltas for {csv_path}: {e}", file=sys.stderr)
+                continue
+
+            # Trim each episode's range within this session
+            for list_idx, start, end in episodes_in_session:
+                # Extract the delta slice for this episode
+                # deltas[i] = ||row[i+1] - row[i]||, so for rows [start:end]
+                # we need deltas[start : end-1]  (end-1 transitions)
+                d_start = max(start, 0)
+                d_end = min(end, len(full_deltas))  # deltas has len(data)-1 entries
+                if d_end <= d_start:
+                    continue
+
+                ep_deltas = full_deltas[d_start:d_end]
+                ep_n_rows = end - start + 1
+
+                trim_start, trim_end = find_trim_range(ep_deltas, ep_n_rows, self.trim_threshold)
+
+                # No motion detected, or no trim needed
+                if trim_start == 0 and trim_end == ep_n_rows - 1:
+                    continue
+
+                new_start = start + trim_start
+                new_end   = start + trim_end
+
+                if new_end - new_start + 1 < 10:  # min episode length
+                    continue
+
+                if new_start != start or new_end != end:
+                    ann, ref, src, dst, _, _ = trimmed_planned[list_idx]
+                    trimmed_planned[list_idx] = (ann, ref, src, dst, new_start, new_end)
+                    removed = ep_n_rows - (new_end - new_start + 1)
+                    stats["trimmed"] += 1
+                    stats["frames_removed"] += removed
+
+        return trimmed_planned, stats
 
     def _run_pipeline_conversion(self, LeRobotDataset, write_info):
         """Full pipeline: run_filter_episodes → plan_episodes → accelerated convert."""
@@ -633,7 +701,7 @@ class ConversionWorker:
         max_time_diff_ms = self.fps
 
         print(
-            f"Stage 1/3: Filtering & synchronising episodes "
+            f"Stage 1/{4 if self.trim_threshold > 0 else 3}: Filtering & synchronising episodes "
             f"(threshold={max_time_diff_ms:.1f}ms)..."
         )
         rc = run_filter_episodes(
@@ -657,7 +725,8 @@ class ConversionWorker:
         # ---------------------------------------------------------------
         # Stage 2: Plan affordance-based episode slices
         # ---------------------------------------------------------------
-        print("Stage 2/3: Planning affordance slices...")
+        n_stages = 4 if self.trim_threshold > 0 else 3
+        print(f"Stage 2/{n_stages}: Planning affordance slices...")
         planned = plan_episodes(
             self.annotations_dir,
             self.source_path,             # raw data = cautery reference dir
@@ -678,9 +747,27 @@ class ConversionWorker:
             sys.exit(1)
 
         # ---------------------------------------------------------------
-        # Stage 3: Accelerated conversion to LeRobot
+        # Stage 2.5: Trim stationary frames (optional)
         # ---------------------------------------------------------------
-        print("Stage 3/3: Converting to LeRobot format...")
+        if self.trim_threshold > 0:
+            print(
+                f"Stage 3/{n_stages}: Trimming stationary frames "
+                f"(threshold={self.trim_threshold})..."
+            )
+            planned, trim_stats = self._trim_stationary_episodes(planned)
+            print(
+                f"  Trimmed {trim_stats['trimmed']}/{trim_stats['total']} "
+                f"episodes, removed {trim_stats['frames_removed']} total frames"
+            )
+
+            if self.cancelled:
+                print("Cancelled by user")
+                sys.exit(1)
+
+        # ---------------------------------------------------------------
+        # Stage N: Accelerated conversion to LeRobot
+        # ---------------------------------------------------------------
+        print(f"Stage {n_stages}/{n_stages}: Converting to LeRobot format...")
         output_path = self.output_dir / self.dataset_name
         print(f"Output path: {output_path}")
         if output_path.exists():
@@ -1076,6 +1163,14 @@ def main():
         help="Overwrite the output dataset if it already exists."
     )
 
+    parser.add_argument(
+        "--trim-threshold", type=float, default=1e-4,
+        help=(
+            "Joint-space L2 delta threshold for trimming stationary frames "
+            "from episode start/end. Set to 0 to disable trimming."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Handle clear cache
@@ -1128,6 +1223,7 @@ def main():
         psm2_tool=args.psm2_tool,
         fps=args.fps,
         annotations_dir=args.annotations_dir,
+        trim_threshold=args.trim_threshold,
     )
 
     # Handle SIGINT (Ctrl+C) gracefully
