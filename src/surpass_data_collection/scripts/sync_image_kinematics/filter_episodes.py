@@ -444,6 +444,11 @@ def load_camera_timestamps(
         logger.debug(f"Camera directory not found: {src_dir}")
         return candidates
 
+    # Strip .jpg so the bare suffix (e.g. "_right") matches both:
+    #   Old: frame{ts}_right.jpg      (suffix at end)
+    #   New: frame{seq}_right_{s}_{ns}.jpg  (suffix in middle)
+    suffix_bare: str = suffix.replace(".jpg", "")
+
     try:
         # Use scandir for efficiency
         with os.scandir(src_dir) as entries:
@@ -451,7 +456,7 @@ def load_camera_timestamps(
                 if (
                     entry.is_file()
                     and entry.name.endswith(".jpg")
-                    and suffix in entry.name
+                    and suffix_bare in entry.name
                 ):
                     try:
                         ts: int = extract_timestamp_from_filename(entry.name)
@@ -613,8 +618,23 @@ def copy_filtered_episode(
             if not _copy_or_link(src_left, dst_left):
                 continue
 
-            # Copy matched secondary frames (renamed to left timestamp)
-            base_name: str = left_fname.replace("_left.jpg", "")
+            # Build camera-agnostic base from the left filename.
+            # Old format: frame{ts}_left.jpg          → base = "frame{ts}"
+            # New format: frame{seq}_left_{s}_{ns}.jpg → base = "frame{seq}"
+            # Then secondary names are built as: base + suffix  (old)
+            #   or: base + cam_suffix_bare + "_" + ts_part + ".jpg"  (new)
+            import re as _re
+            _new_m = _re.match(
+                r"(frame\d+)_left_(\d+_\d+)\.jpg", left_fname
+            )
+            if _new_m:
+                # New format: reconstruct as frame{seq}_{cam}_{sec}_{ns}.jpg
+                _base_seq = _new_m.group(1)   # e.g. "frame000000"
+                _ts_part  = _new_m.group(2)   # e.g. "1772838053_710332121"
+            else:
+                # Old format: frame{ts}_left.jpg
+                _base_seq = left_fname.replace("_left.jpg", "")
+                _ts_part  = None
 
             for src_name, suffix, dst_name in CAMERA_CONFIGS:
                 if src_name == "left_img_dir":
@@ -624,7 +644,14 @@ def copy_filtered_episode(
 
                 match_fname = secondary_fnames[src_name][i]
                 src_file = episode_path / src_name / match_fname
-                new_name = f"{base_name}{suffix}"
+                # Build destination name consistent with the source format
+                if _ts_part is not None:
+                    # New format: frame{seq}_{cam}_{sec}_{ns}.jpg
+                    cam_suffix_bare = suffix.replace(".jpg", "")  # e.g. "_right"
+                    new_name = f"{_base_seq}{cam_suffix_bare}_{_ts_part}.jpg"
+                else:
+                    # Old format: frame{ts}_{cam}.jpg
+                    new_name = f"{_base_seq}{suffix}"
                 dst_file = dest_episode_dir / dst_name / new_name
 
                 if src_file.exists():

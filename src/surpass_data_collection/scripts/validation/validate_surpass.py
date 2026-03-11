@@ -935,7 +935,7 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "dataset_path", type=Path,
+        "--dataset_path", type=Path,
         help="Path to the LeRobot dataset root directory.",
     )
     parser.add_argument(

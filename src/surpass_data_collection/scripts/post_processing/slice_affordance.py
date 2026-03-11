@@ -120,6 +120,9 @@ from surpass_data_collection.scripts.post_processing.reformat_data import run_re
 # Regular expression for extracting frame numbers/timestamps
 FRAME_RE = re.compile(r"frame(\d+)")
 
+# New-format regex: frame{seq}_{camera}_{seconds}_{nanoseconds}.jpg
+NEW_FORMAT_RE = re.compile(r"frame\d+_(?:left|right|psm1|psm2)_(\d+)_(\d+)\.jpg")
+
 # Mapping from raw action names to numbered output subdirectories
 # This ensures consistent ordering in the output structure
 ACTION_SUBDIRS: Dict[str, str] = {
@@ -133,8 +136,11 @@ DEFAULT_COPY_WORKERS: int = 8
 # Default number of parallel episodes to process
 DEFAULT_EPISODE_WORKERS: int = 4
 
-# Post-process directory naming pattern
-POST_PROCESS_PATTERN: str = r"cautery_tissue(\d+)_(.+)_left_video$"
+# Post-process directory naming patterns
+# Old: cautery_tissue{N}_{session}_left_video
+POST_PROCESS_PATTERN_OLD: str = r"cautery_tissue(\d+)_(.+)_left_video$"
+# New: {collector}_tissue{N}_{timestamp}
+POST_PROCESS_PATTERN_NEW: str = r"(\w+)_tissue(\d+)_(.+)$"
 
 # Camera modality configurations
 CAMERA_MODALITIES: List[Tuple[str, str, str]] = [
@@ -190,28 +196,33 @@ def extract_timestamp(filename: str) -> int:
     """
     Extract nanosecond timestamp from frame filename.
 
-    Parses filenames following the pattern 'frame{timestamp}_{camera}.jpg'
-    where timestamp is a Unix epoch timestamp in nanoseconds.
+    Supports two filename formats:
+        Old: 'frame{nanosecond_ts}_{camera}.jpg'
+        New: 'frame{seq}_{camera}_{seconds}_{nanoseconds}.jpg'
 
     Args:
-        filename: Image filename to parse. Expected format like
-            'frame1756826516968031906_left.jpg'.
+        filename: Image filename to parse.
 
     Returns:
         Extracted timestamp in nanoseconds as integer.
 
     Raises:
-        ValueError: If filename does not contain a timestamp pattern.
-
-    Notes:
-        - Uses regex pattern to find frame number
-        - Assumes timestamp is the numeric part after 'frame'
-        - Case-sensitive matching
+        ValueError: If filename does not contain a valid timestamp pattern.
     """
+    # Try new format first (more specific)
+    new_match = NEW_FORMAT_RE.search(filename)
+    if new_match:
+        seconds = int(new_match.group(1))
+        nanoseconds = int(new_match.group(2))
+        timestamp = seconds * 1_000_000_000 + nanoseconds
+        logger.debug(f"Extracted timestamp {timestamp} from {filename} (new format)")
+        return timestamp
+
+    # Fall back to old format
     match = FRAME_RE.search(filename)
     if match:
-        timestamp: int = int(match.group(1))
-        logger.debug(f"Extracted timestamp {timestamp} from {filename}")
+        timestamp = int(match.group(1))
+        logger.debug(f"Extracted timestamp {timestamp} from {filename} (old format)")
         return timestamp
     raise ValueError(f"Could not extract timestamp from filename: {filename}")
 
@@ -244,29 +255,26 @@ def list_sorted_frames(src_dir: Path, suffix: str) -> List[str]:
     """
     List and sort frame filenames in a directory.
 
-    Scans directory for files with specified suffix and sorts them by
-    frame number/timestamp for chronological processing.
+    Supports both old and new filename formats by checking if the suffix
+    string appears anywhere in the filename (not just at the end).
 
     Args:
         src_dir: Directory to search for frame files.
         suffix: File suffix to filter by (e.g., '_left.jpg', '_psm1.jpg').
 
     Returns:
-        Sorted list of filenames. Empty list if directory doesn't exist
-        or contains no matching files.
-
-    Notes:
-        - Returns empty list (not error) if directory missing
-        - Only includes files (ignores subdirectories)
-        - Sorts using natural ordering via _frame_key()
-        - Case-sensitive suffix matching
+        Sorted list of filenames. Empty list if directory doesn't exist.
     """
     if not src_dir.is_dir():
         logger.debug(f"Directory not found: {src_dir}")
         return []
 
+    # Use 'suffix in name' instead of 'endswith(suffix)' to support
+    # new format where camera suffix is mid-filename
+    suffix_bare = suffix.replace(".jpg", "")  # e.g. "_left"
     files: List[str] = [
-        f.name for f in src_dir.iterdir() if f.is_file() and f.name.endswith(suffix)
+        f.name for f in src_dir.iterdir()
+        if f.is_file() and f.name.endswith(".jpg") and suffix_bare in f.name
     ]
 
     files.sort(key=_frame_key)
@@ -280,32 +288,19 @@ def list_sorted_frames(src_dir: Path, suffix: str) -> List[str]:
 # ---------------------------------------------------------------------
 
 
-def find_sessions(post_process_dir: Path) -> Iterator[Tuple[Path, int, str]]:
+def find_sessions(
+    post_process_dir: Path,
+) -> Iterator[Tuple[Path, int, str, Optional[str]]]:
     """
-    Discover post-process session directories containing annotations.
+    Discover annotation session directories.
 
-    Scans the post-process directory for session folders matching the
-    expected naming pattern and yields their metadata.
-
-    Args:
-        post_process_dir: Root directory containing post-process output
-            with annotation subdirectories.
+    Supports two naming conventions:
+        Old: cautery_tissue{N}_{session}_left_video
+        New: {collector}_tissue{N}_{timestamp}
 
     Yields:
-        Tuples of (directory_path, tissue_number, session_name) for each
-        discovered session. Empty iterator if directory doesn't exist.
-
-    Session Directory Pattern:
-        cautery_tissue{N}_{session_name}_left_video
-        - N: Tissue number (integer)
-        - session_name: Arbitrary session identifier
-        - Must end with '_left_video' suffix
-
-    Notes:
-        - Only yields directories matching the pattern
-        - Skips files and non-matching directories
-        - Tissue number extracted as integer
-        - Session name includes all text between tissue# and _left_video
+        (directory_path, tissue_number, session_name, collector)
+        collector is None for old-format directories.
     """
     if not post_process_dir.is_dir():
         logger.warning(f"Post-process directory not found: {post_process_dir}")
@@ -317,17 +312,29 @@ def find_sessions(post_process_dir: Path) -> Iterator[Tuple[Path, int, str]]:
         if not entry.is_dir():
             continue
 
-        # Match pattern: cautery_tissue<N>_<session_name>_left_video
-        match = re.match(POST_PROCESS_PATTERN, entry.name)
-        if not match:
-            logger.debug(f"Skipping non-matching directory: {entry.name}")
+        # Try old pattern first: cautery_tissue{N}_{session}_left_video
+        match = re.match(POST_PROCESS_PATTERN_OLD, entry.name)
+        if match:
+            tissue = int(match.group(1))
+            session = match.group(2)
+            logger.debug(f"Found old-format session: tissue={tissue}, session={session}")
+            yield entry, tissue, session, None
             continue
 
-        tissue: int = int(match.group(1))
-        session: str = match.group(2)
+        # Try new pattern: {collector}_tissue{N}_{timestamp}
+        match = re.match(POST_PROCESS_PATTERN_NEW, entry.name)
+        if match:
+            collector = match.group(1)
+            tissue = int(match.group(2))
+            session = match.group(3)
+            logger.debug(
+                f"Found new-format session: collector={collector}, "
+                f"tissue={tissue}, session={session}"
+            )
+            yield entry, tissue, session, collector
+            continue
 
-        logger.debug(f"Found session: tissue={tissue}, session={session}")
-        yield entry, tissue, session
+        logger.debug(f"Skipping non-matching directory: {entry.name}")
 
 
 def read_annotation_jsons(annotation_dir: Path) -> Iterator[Path]:
@@ -358,7 +365,7 @@ def read_annotation_jsons(annotation_dir: Path) -> Iterator[Path]:
 
     for root, _, files in os.walk(annotation_dir):
         for filename in files:
-            if filename.lower().endswith(".json"):
+            if filename.lower().endswith(".json") and not filename.lower().endswith("_prompt.json"):
                 json_count += 1
                 yield Path(root) / filename
 
@@ -550,58 +557,25 @@ def plan_episodes(
     """
     Scan annotations and plan episode extraction.
 
-    Discovers all annotation files, parses affordance ranges, and generates
-    a plan for which data should be extracted into which output directories.
-
-    Args:
-        post_dir: Root directory of post-process annotations containing
-            session subdirectories.
-        cautery_dir: Root directory of raw cautery data. Used as reference
-            for timestamp alignment.
-        out_dir: Output root directory for sliced dataset.
-        source_dataset_dir: Root directory of dataset to slice. If None,
-            uses cautery_dir as source.
+    Supports both old (cautery_tissue#N/session) and new
+    (collector/Tissue#N/session) data layouts.
 
     Returns:
-        List of planning tuples, each containing:
-            (annotation_path, ref_session_dir, src_session_dir,
-             dst_base_dir, start_frame, end_frame)
-
-    Planning Logic:
-        1. Find all post-process sessions
-        2. For each session, find annotation JSONs
-        3. Parse affordance_range from each JSON
-        4. Map action name to output subdirectory
-        5. Generate sequential episode IDs per (tissue, subtask)
-        6. Build destination path preserving hierarchy
-
-    Output Path Structure:
-        out_dir/tissue_{N}/{action_subdir}/episode_{XXX}/
-        - N: Tissue number
-        - action_subdir: Mapped action name (1_grasp, 2_dissect, etc.)
-        - XXX: Zero-padded sequential episode ID (001, 002, ...)
-
-    Notes:
-        - Episode IDs are sequential per (tissue, action) combination
-        - Skips annotations with missing or invalid ranges
-        - Logs warnings for problematic annotations
+        List of (annotation_path, ref_session_dir, src_session_dir,
+                 dst_base_dir, start_frame, end_frame).
     """
     logger.info("Planning episode extraction")
 
     planned_episodes: List[Tuple[Path, Path, Path, Path, int, int]] = []
+    episode_counters: Dict[Tuple[str, int, str], int] = {}
 
-    # Track episode counts per (tissue, subtask) for sequential IDs
-    episode_counters: Dict[Tuple[int, str], int] = {}
-
-    # Default source to reference if not specified
     if source_dataset_dir is None:
         source_dataset_dir = cautery_dir
         logger.info("Using cautery_dir as source dataset")
 
     sessions_found: int = 0
 
-    # Discover sessions
-    for post_path, tissue_num, session_name in find_sessions(post_dir):
+    for post_path, tissue_num, session_name, collector in find_sessions(post_dir):
         sessions_found += 1
         annotation_dir: Path = post_path / "annotation"
 
@@ -611,26 +585,47 @@ def plan_episodes(
             )
             continue
 
-        # Resolve reference session directory (raw cautery data)
-        ref_session_dir: Path = (
-            cautery_dir / f"cautery_tissue#{tissue_num}" / session_name
-        )
+        # Resolve reference session directory (raw data)
+        if collector is not None:
+            # New format: cautery_dir / collector / Tissue#N / session
+            ref_session_dir = (
+                cautery_dir / collector / f"Tissue#{tissue_num}" / session_name
+            )
+        else:
+            # Old format: cautery_dir / cautery_tissue#N / session
+            ref_session_dir = (
+                cautery_dir / f"cautery_tissue#{tissue_num}" / session_name
+            )
 
         # Resolve source session directory
         if source_dataset_dir == cautery_dir:
             src_session_dir = ref_session_dir
         else:
-            # Try converted structure: tissue_N/session_name
-            src_session_dir = (
-                source_dataset_dir / f"tissue_{tissue_num}" / session_name
-            )
-            if not src_session_dir.exists():
-                # Fallback to raw structure
+            if collector is not None:
+                # New: try collector_tissueN/session, then collector/Tissue#N/session
                 src_session_dir = (
                     source_dataset_dir
-                    / f"cautery_tissue#{tissue_num}"
+                    / f"{collector}_tissue{tissue_num}"
                     / session_name
                 )
+                if not src_session_dir.exists():
+                    src_session_dir = (
+                        source_dataset_dir
+                        / collector
+                        / f"Tissue#{tissue_num}"
+                        / session_name
+                    )
+            else:
+                # Old: try tissue_N/session, then cautery_tissue#N/session
+                src_session_dir = (
+                    source_dataset_dir / f"tissue_{tissue_num}" / session_name
+                )
+                if not src_session_dir.exists():
+                    src_session_dir = (
+                        source_dataset_dir
+                        / f"cautery_tissue#{tissue_num}"
+                        / session_name
+                    )
 
         # Validate directories exist
         if not ref_session_dir.is_dir():
@@ -654,14 +649,13 @@ def plan_episodes(
                 logger.warning(f"Failed to read JSON {ann_path}: {e}")
                 continue
 
-            # Extract affordance range (handle typo in field name)
+            # Extract affordance range
             affordance = ann_data.get("affordance_range")
 
             if not affordance:
                 logger.warning(f"No affordance_range in {ann_path}")
                 continue
 
-            # Parse range values
             try:
                 start: int = int(affordance.get("start"))
                 end: int = int(affordance.get("end"))
@@ -674,18 +668,20 @@ def plan_episodes(
             subtask_dir_name: str = ACTION_SUBDIRS.get(action, action)
 
             # Generate sequential episode ID
-            counter_key: Tuple[int, str] = (tissue_num, subtask_dir_name)
+            counter_key = (collector or "", tissue_num, subtask_dir_name)
             idx: int = episode_counters.get(counter_key, 0) + 1
             episode_counters[counter_key] = idx
 
             episode_name: str = f"episode_{idx:03d}"
 
             # Build destination path
+            if collector is not None:
+                tissue_label = f"{collector}_tissue{tissue_num}"
+            else:
+                tissue_label = f"tissue_{tissue_num}"
+
             dst_base: Path = (
-                out_dir
-                / f"tissue_{tissue_num}"
-                / subtask_dir_name
-                / episode_name
+                out_dir / tissue_label / subtask_dir_name / episode_name
             )
 
             planned_episodes.append(
@@ -702,9 +698,7 @@ def plan_episodes(
         f"{sessions_found} sessions"
     )
 
-    # CRITICAL: Sort planned episodes deterministically by destination path.
-    # On Windows/Linux, iterdir() is arbitrary. Without sorting, the GUI's 
-    # 'skip_count' resume logic will skip random episodes instead of the oldest ones.
+    # Sort deterministically by destination path
     planned_episodes.sort(key=lambda x: str(x[3]))
 
     return planned_episodes

@@ -112,48 +112,43 @@ PROGRESS_REPORT_INTERVAL: int = 1000
 logger = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------
-# Timestamp Extraction Functions
-# ---------------------------------------------------------------------
+# Pre-compiled regex patterns for timestamp extraction
+# New format: frame{seq}_{camera}_{seconds}_{nanoseconds}.jpg
+_NEW_FORMAT_RE = re.compile(r"frame\d+_(?:left|right|psm1|psm2)_(\d+)_(\d+)\.jpg")
+# Old format: frame{nanosecond_ts}_{camera}.jpg
+_OLD_FORMAT_RE = re.compile(r"frame(\d+)_\w+\.jpg")
 
 
 def extract_timestamp_from_filename(filename: str) -> int:
     """
     Extract nanosecond timestamp from image filename.
 
-    Parses filenames following the pattern 'frame{timestamp}_{camera}.jpg'
-    where timestamp is a Unix epoch timestamp in nanoseconds.
+    Supports two filename formats:
+        Old: 'frame{nanosecond_ts}_{camera}.jpg'
+             e.g. 'frame1756826516968031906_left.jpg'
+        New: 'frame{seq}_{camera}_{seconds}_{nanoseconds}.jpg'
+             e.g. 'frame000000_left_1772838053_710332121.jpg'
 
     Args:
-        filename: Image filename to parse. Should match pattern like
-            'frame1756826516968031906_left.jpg'.
+        filename: Image filename to parse.
 
     Returns:
         Extracted timestamp in nanoseconds as an integer.
 
     Raises:
-        ValueError: If the filename does not match the expected pattern
-            or timestamp cannot be parsed as integer.
-
-    Notes:
-        - Case-sensitive matching
+        ValueError: If the filename does not match either expected pattern.
     """
-    # Pattern to match frame{timestamp}_{camera}.jpg
-    pattern: str = r"frame(\d+)_\w+\.jpg"
-    match = re.search(pattern, filename)
+    # Try new format first (more specific pattern)
+    new_match = _NEW_FORMAT_RE.search(filename)
+    if new_match:
+        return int(new_match.group(1)) * 1_000_000_000 + int(new_match.group(2))
 
-    if match:
-        try:
-            timestamp: int = int(match.group(1))
-            logger.debug(f"Extracted timestamp {timestamp} from {filename}")
-            return timestamp
-        except ValueError as e:
-            logger.error(f"Failed to parse timestamp as integer from {filename}: {e}")
-            raise ValueError(
-                f"Could not parse timestamp from filename: {filename}"
-            ) from e
-    else:
-        raise ValueError(f"Could not extract timestamp from filename: {filename}")
+    # Fall back to old format
+    old_match = _OLD_FORMAT_RE.search(filename)
+    if old_match:
+        return int(old_match.group(1))
+
+    raise ValueError(f"Could not extract timestamp from filename: {filename}")
 
 
 def load_image_timestamps(
@@ -162,59 +157,50 @@ def load_image_timestamps(
     """
     Load all image files from a directory and extract their timestamps.
 
-    Scans the specified directory for image files matching the camera suffix,
-    extracts timestamps, and returns them sorted chronologically.
+    Uses os.scandir for fast directory traversal and supports both old
+    and new filename formats.
 
     Args:
-        image_dir: Directory containing image files. Must be a valid,
-            readable directory path.
-        camera_suffix: Camera suffix to filter images. Must be one of:
-            "_left", "_right", "_psm1", "_psm2". Default is "_left".
+        image_dir: Directory containing image files.
+        camera_suffix: Camera suffix to filter images (e.g. "_left").
 
     Returns:
-        List of tuples (filename, timestamp), sorted by timestamp in
-        ascending order. Returns empty list if no valid images found.
-
-    Notes:
-        - Only processes .jpg files
-        - Invalid filenames are skipped with warning logged
-        - Sorting ensures chronological processing
+        List of (filename, timestamp) tuples, sorted by timestamp.
     """
     image_dir_path: Path = Path(image_dir)
-    pattern: Path = image_dir_path / f"frame*{camera_suffix}.jpg"
 
-    logger.debug(f"Scanning for images in: {image_dir_path} with suffix: {camera_suffix}")
-
-    # Use glob to find matching files
-    image_files: List[str] = glob.glob(str(pattern))
-
-    if not image_files:
-        logger.warning(f"No image files found matching pattern: {pattern}")
+    if not image_dir_path.is_dir():
+        logger.warning(f"Image directory not found: {image_dir_path}")
+        return []
 
     image_timestamps: List[Tuple[str, int]] = []
     skipped_count: int = 0
 
-    for img_file in image_files:
-        filename: str = os.path.basename(img_file)
-        try:
-            timestamp: int = extract_timestamp_from_filename(filename)
-            image_timestamps.append((filename, timestamp))
-        except ValueError as e:
-            # Skip files that don't match expected format
-            logger.debug(f"Skipping file with invalid format: {filename}")
-            skipped_count += 1
-            continue
+    # os.scandir is faster than glob — single syscall per entry,
+    # no full-path string construction needed.
+    with os.scandir(image_dir_path) as entries:
+        for entry in entries:
+            if (
+                entry.is_file()
+                and entry.name.endswith(".jpg")
+                and camera_suffix in entry.name
+            ):
+                try:
+                    timestamp = extract_timestamp_from_filename(entry.name)
+                    image_timestamps.append((entry.name, timestamp))
+                except ValueError:
+                    skipped_count += 1
+
+    if not image_timestamps:
+        logger.warning(f"No image files found with suffix '{camera_suffix}' in: {image_dir_path}")
 
     if skipped_count > 0:
         logger.warning(f"Skipped {skipped_count} files with invalid timestamp format")
 
-    # Sort by timestamp to ensure chronological order
+    # Sort by timestamp
     image_timestamps.sort(key=lambda x: x[1])
 
-    logger.info(
-        f"Loaded {len(image_timestamps)} image timestamps from {image_dir_path}"
-    )
-
+    logger.info(f"Loaded {len(image_timestamps)} image timestamps from {image_dir_path}")
     return image_timestamps
 
 
@@ -309,181 +295,104 @@ def load_kinematics_data(csv_file: Union[str, Path]) -> pd.DataFrame:
 
 def find_nearest_kinematics(
     image_timestamps: List[Tuple[str, int]], kinematics_df: pd.DataFrame
-) -> List[Dict[str, Any]]:
+) -> pd.DataFrame:
     """
-    Find the nearest kinematic data point for each image timestamp.
+    Find nearest kinematic data point for each image timestamp (vectorized).
 
-    Uses efficient binary search (np.searchsorted) to find the closest
-    kinematic timestamp for each image. Checks both neighbors to ensure
-    absolute minimum distance.
+    Uses bulk np.searchsorted to match ALL images to their nearest
+    kinematic timestamp in a single vectorized pass — no Python loop.
 
     Args:
-        image_timestamps: List of (filename, timestamp) tuples from images.
-            Should be sorted by timestamp for optimal performance.
-        kinematics_df: DataFrame containing kinematic data with 'timestamp_ns'
-            column. Should be sorted by timestamp.
+        image_timestamps: Sorted list of (filename, timestamp) tuples.
+        kinematics_df: DataFrame with 'timestamp_ns' column.
 
     Returns:
-        List of dictionaries, one per image, containing:
-            - image_filename: str
-            - image_timestamp_ns: int
-            - kinematics_idx: int (index into kinematics_df)
-            - kinematics_timestamp_ns: int
-            - time_diff_ns: int (signed difference)
-            - time_diff_ms: float (signed difference in milliseconds)
-
-    Algorithm:
-        - Uses np.searchsorted for search per image
-        - Compares both neighbors (idx and idx-1) for absolute minimum
-        - Handles edge cases (first/last kinematic points)
-
-    Notes:
-        - Assumes kinematics_timestamps are sorted (not validated)
-        - Returns signed time differences (positive = image after kinematic)
-        - All timestamps should be in same epoch reference
-        - Memory efficient: processes one image at a time
+        DataFrame with columns: image_filename, image_timestamp_ns,
+        kinematics_idx, kinematics_timestamp_ns, time_diff_ns, time_diff_ms.
+        Empty DataFrame if no kinematic data.
     """
     logger.info(
         f"Finding nearest kinematics for {len(image_timestamps)} images "
         f"in {len(kinematics_df)} kinematic points"
     )
 
-    sync_results: List[Dict[str, Any]] = []
-    kinematics_timestamps: np.ndarray = kinematics_df["timestamp_ns"].values
-
-    if len(kinematics_timestamps) == 0:
+    kin_ts: np.ndarray = kinematics_df["timestamp_ns"].values
+    if len(kin_ts) == 0:
         logger.error("Kinematic data has no timestamps")
-        return sync_results
+        return pd.DataFrame()
 
-    # Progress tracking for large datasets
-    report_interval: int = PROGRESS_REPORT_INTERVAL
-    processed: int = 0
+    # Unzip filenames and timestamps into separate arrays
+    filenames = [ft[0] for ft in image_timestamps]
+    img_ts = np.array([ft[1] for ft in image_timestamps], dtype=np.int64)
 
-    for filename, img_timestamp in image_timestamps:
-        # Binary search to find insertion point
-        # idx is such that: kinematics[idx-1] <= img_timestamp < kinematics[idx]
-        idx: int = np.searchsorted(kinematics_timestamps, img_timestamp)
+    # Vectorized nearest-neighbor search
+    idx = np.searchsorted(kin_ts, img_ts)
+    idx = np.clip(idx, 0, len(kin_ts) - 1)
+    prev = np.clip(idx - 1, 0, len(kin_ts) - 1)
 
-        # Determine the nearest neighbor by checking idx and idx-1
-        best_idx: int = 0
+    diff_curr = np.abs(kin_ts[idx] - img_ts)
+    diff_prev = np.abs(kin_ts[prev] - img_ts)
+    use_prev = diff_prev < diff_curr
 
-        if idx == 0:
-            # Image timestamp is before all kinematic points
-            best_idx = 0
-        elif idx == len(kinematics_timestamps):
-            # Image timestamp is after all kinematic points
-            best_idx = len(kinematics_timestamps) - 1
-        else:
-            # Compare distances to idx and idx-1
-            diff_curr: int = abs(kinematics_timestamps[idx] - img_timestamp)
-            diff_prev: int = abs(kinematics_timestamps[idx - 1] - img_timestamp)
+    best_idx = np.where(use_prev, prev, idx)
+    best_ts = kin_ts[best_idx]
+    time_diff_ns = (img_ts - best_ts).astype(np.int64)
 
-            if diff_curr < diff_prev:
-                best_idx = idx
-            else:
-                best_idx = idx - 1
+    sync_df = pd.DataFrame({
+        "image_filename": filenames,
+        "image_timestamp_ns": img_ts,
+        "kinematics_idx": best_idx,
+        "kinematics_timestamp_ns": best_ts,
+        "time_diff_ns": time_diff_ns,
+        "time_diff_ms": time_diff_ns / 1e6,
+    })
 
-        nearest_timestamp: int = int(kinematics_timestamps[best_idx])
-        time_diff_ns: int = int(img_timestamp - nearest_timestamp)
-        time_diff_ms: float = float(time_diff_ns / 1e6)
-
-        sync_info: Dict[str, Any] = {
-            "image_filename": filename,
-            "image_timestamp_ns": int(img_timestamp),
-            "kinematics_idx": int(best_idx),
-            "kinematics_timestamp_ns": nearest_timestamp,
-            "time_diff_ns": time_diff_ns,
-            "time_diff_ms": time_diff_ms,
-        }
-        sync_results.append(sync_info)
-
-        processed += 1
-        if processed % report_interval == 0:
-            logger.debug(f"Processed {processed}/{len(image_timestamps)} images")
-
-    logger.info(f"Completed synchronization for {len(sync_results)} images")
-
-    return sync_results
+    logger.info(f"Completed synchronization for {len(sync_df)} images")
+    return sync_df
 
 
 def remove_outliers(
-    sync_results: List[Dict[str, Any]], max_time_diff_ms: float = DEFAULT_MAX_TIME_DIFF_MS
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    sync_df: pd.DataFrame, max_time_diff_ms: float = DEFAULT_MAX_TIME_DIFF_MS
+) -> Tuple[pd.DataFrame, int]:
     """
-    Remove outliers where time difference exceeds threshold.
-
-    Filters synchronization results to remove frames where the time difference
-    between image and kinematic data exceeds the specified threshold. This
-    helps remove poorly synchronized frames from the dataset.
+    Remove outliers where time difference exceeds threshold (vectorized).
 
     Args:
-        sync_results: List of sync information dictionaries from
-            find_nearest_kinematics().
-        max_time_diff_ms: Maximum allowed absolute time difference in
-            milliseconds. Frames exceeding this are considered outliers.
-            Default is 30.0 ms.
+        sync_df: DataFrame from find_nearest_kinematics.
+        max_time_diff_ms: Maximum allowed absolute time difference (ms).
 
     Returns:
-        Tuple containing:
-            - filtered_results: List of sync dicts within threshold
-            - outliers_removed: List of sync dicts exceeding threshold
-
-    Notes:
-        - Uses absolute value (both positive and negative differences count)
-        - Threshold is inclusive (values == max_time_diff_ms are kept)
-        - Preserves original order of results
-        - Logs statistics about outlier distribution
+        Tuple of (filtered_df, num_outliers_removed).
     """
-    logger.debug(
-        f"Removing outliers with threshold: {max_time_diff_ms} ms "
-        f"from {len(sync_results)} results"
-    )
+    mask = sync_df["time_diff_ms"].abs() <= max_time_diff_ms
+    n_outliers = int((~mask).sum())
 
-    filtered_results: List[Dict[str, Any]] = []
-    outliers_removed: List[Dict[str, Any]] = []
-
-    for result in sync_results:
-        abs_time_diff: float = abs(result["time_diff_ms"])
-        if abs_time_diff <= max_time_diff_ms:
-            filtered_results.append(result)
-        else:
-            outliers_removed.append(result)
-
-    # Log outlier statistics
-    if outliers_removed:
-        outlier_diffs: List[float] = [abs(r["time_diff_ms"]) for r in outliers_removed]
+    if n_outliers > 0:
+        outlier_diffs = sync_df.loc[~mask, "time_diff_ms"].abs()
         logger.info(
-            f"Removed {len(outliers_removed)} outliers "
-            f"(range: {min(outlier_diffs):.2f} - {max(outlier_diffs):.2f} ms)"
+            f"Removed {n_outliers} outliers "
+            f"(range: {outlier_diffs.min():.2f} - {outlier_diffs.max():.2f} ms)"
         )
     else:
         logger.debug("No outliers found")
 
-    logger.info(
-        f"Filtered results: {len(filtered_results)} kept, "
-        f"{len(outliers_removed)} removed"
-    )
+    filtered = sync_df.loc[mask].reset_index(drop=True)
+    logger.info(f"Filtered results: {len(filtered)} kept, {n_outliers} removed")
 
-    return filtered_results, outliers_removed
+    return filtered, n_outliers
 
 
-def get_valid_image_filenames(sync_results: List[Dict[str, Any]]) -> List[str]:
+def get_valid_image_filenames(sync_df: pd.DataFrame) -> List[str]:
     """
-    Extract list of valid image filenames from sync results.
-
-    Convenience function to extract just the filenames from synchronization
-    results, useful for subsequent filtering operations.
+    Extract list of valid image filenames from sync DataFrame.
 
     Args:
-        sync_results: List of sync information dictionaries.
+        sync_df: Filtered sync DataFrame.
 
     Returns:
-        List of image filenames that passed synchronization checks.
-
-    Notes:
-        - Preserves original order from sync_results
+        List of image filenames.
     """
-    filenames: List[str] = [result["image_filename"] for result in sync_results]
+    filenames = sync_df["image_filename"].tolist()
     logger.debug(f"Extracted {len(filenames)} valid filenames")
     return filenames
 
@@ -494,52 +403,26 @@ def get_valid_image_filenames(sync_results: List[Dict[str, Any]]) -> List[str]:
 
 
 def plot_time_differences(
-    sync_results: List[Dict[str, Any]], output_dir: Optional[str] = None
+    sync_df: pd.DataFrame, output_dir: Optional[str] = None
 ) -> None:
     """
     Plot time differences between images and kinematic data.
 
-    Creates a two-panel visualization:
-        1. Time series plot showing temporal evolution of sync differences
-        2. Histogram showing distribution of sync differences
-
-    Includes statistical annotations (mean, std, max) and saves to file
-    if output directory is specified.
-
     Args:
-        sync_results: List of sync information dictionaries containing
-            'time_diff_ms' values.
-        output_dir: Directory to save plots. If None, plot is displayed
-            but not saved. Directory will be created if it doesn't exist.
-
-    Returns:
-        None. Plot is saved to disk or displayed.
-
-    Side Effects:
-        - Creates output directory if it doesn't exist
-        - Writes PNG file to output_dir/sync_analysis.png
-        - Logs plot save location
-
-    Plot Features:
-        - Line plot with scatter overlay for temporal view
-        - Statistics box with mean, std, max values
-        - Histogram with mean line overlay
-        - Grid for readability
-        - High DPI (300) for publication quality
+        sync_df: Filtered sync DataFrame with 'time_diff_ms' column.
+        output_dir: Directory to save plots. If None, plot is not saved.
     """
-    if not sync_results:
+    if sync_df.empty:
         logger.warning("No sync results to plot")
         return
 
-    logger.info(f"Generating synchronization plot for {len(sync_results)} results")
+    logger.info(f"Generating synchronization plot for {len(sync_df)} results")
 
-    time_diffs_ms: List[float] = [result["time_diff_ms"] for result in sync_results]
-    image_indices: List[int] = list(range(len(sync_results)))
+    time_diffs_ms = sync_df["time_diff_ms"].values
+    image_indices = np.arange(len(sync_df))
 
-    # Create figure with two subplots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=PLOT_FIGSIZE)
 
-    # Plot 1: Time differences over image sequence
     ax1.plot(image_indices, time_diffs_ms, "b-", alpha=0.7, linewidth=1)
     ax1.scatter(image_indices, time_diffs_ms, c="red", s=20, alpha=0.6)
     ax1.set_xlabel("Image Index")
@@ -547,38 +430,24 @@ def plot_time_differences(
     ax1.set_title("Time Difference Between Images and Nearest Kinematics Data")
     ax1.grid(True, alpha=0.3)
 
-    # Add statistics text box
-    mean_diff: float = float(np.mean(time_diffs_ms))
-    std_diff: float = float(np.std(time_diffs_ms))
-    max_diff: float = float(np.max(np.abs(time_diffs_ms)))
+    mean_diff = float(np.mean(time_diffs_ms))
+    std_diff = float(np.std(time_diffs_ms))
+    max_diff = float(np.max(np.abs(time_diffs_ms)))
 
-    stats_text: str = (
+    stats_text = (
         f"Mean: {mean_diff:.2f} ms\n"
         f"Std: {std_diff:.2f} ms\n"
         f"Max |diff|: {max_diff:.2f} ms"
     )
-
     ax1.text(
-        0.02,
-        0.98,
-        stats_text,
-        transform=ax1.transAxes,
+        0.02, 0.98, stats_text, transform=ax1.transAxes,
         verticalalignment="top",
         bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
     )
 
-    logger.debug(
-        f"Statistics - Mean: {mean_diff:.2f} ms, Std: {std_diff:.2f} ms, "
-        f"Max: {max_diff:.2f} ms"
-    )
-
-    # Plot 2: Histogram of time differences
     ax2.hist(time_diffs_ms, bins=50, alpha=0.7, color="skyblue", edgecolor="black")
     ax2.axvline(
-        mean_diff,
-        color="red",
-        linestyle="--",
-        linewidth=2,
+        mean_diff, color="red", linestyle="--", linewidth=2,
         label=f"Mean: {mean_diff:.2f} ms",
     )
     ax2.set_xlabel("Time Difference (ms)")
@@ -589,16 +458,12 @@ def plot_time_differences(
 
     plt.tight_layout()
 
-    # Save plot if output directory specified
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-        plot_path: str = os.path.join(output_dir, "sync_analysis.png")
+        plot_path = os.path.join(output_dir, "sync_analysis.png")
         plt.savefig(plot_path, dpi=PLOT_DPI, bbox_inches="tight")
         logger.info(f"Plot saved to: {plot_path}")
-        plt.close(fig)  # Close to free memory
-    else:
-        logger.debug("No output directory specified, plot not saved")
-        plt.close(fig)
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------
@@ -606,44 +471,20 @@ def plot_time_differences(
 # ---------------------------------------------------------------------
 
 
-def save_sync_results(sync_results: List[Dict[str, Any]], output_file: str) -> None:
+def save_sync_results(sync_df: pd.DataFrame, output_file: str) -> None:
     """
-    Save synchronization results to CSV file.
-
-    Converts sync results dictionary to DataFrame and writes to CSV with
-    proper formatting.
+    Save synchronization results DataFrame to CSV file.
 
     Args:
-        sync_results: List of sync information dictionaries.
-        output_file: Path where CSV should be written. Parent directories
-            will be created if they don't exist.
-
-    Returns:
-        None. Results are written to disk.
-
-    Raises:
-        OSError: If file cannot be written (permissions, disk space).
-        pd.errors.*: If DataFrame conversion or CSV writing fails.
-
-    Side Effects:
-        - Creates parent directories if needed
-        - Overwrites existing file without warning
-        - Writes CSV with header row
-
-    Notes:
-        - CSV includes all dictionary keys as columns
-        - Index is not written to CSV
-        - Uses pandas default CSV settings
+        sync_df: Sync results DataFrame.
+        output_file: Path where CSV should be written.
     """
-    logger.debug(f"Saving {len(sync_results)} sync results to: {output_file}")
-
-    # Ensure parent directory exists
+    logger.debug(f"Saving {len(sync_df)} sync results to: {output_file}")
     output_path: Path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        df: pd.DataFrame = pd.DataFrame(sync_results)
-        df.to_csv(output_file, index=False)
+        sync_df.to_csv(output_file, index=False)
         logger.info(f"Saved sync results to: {output_file}")
     except Exception as e:
         logger.error(f"Failed to save sync results to {output_file}: {e}", exc_info=True)
@@ -763,15 +604,13 @@ def process_episode_sync(
             logger.error(error_msg)
             return {"success": False, "error": error_msg}
 
-        # Perform synchronization
-        sync_results: List[Dict[str, Any]] = find_nearest_kinematics(
+        # Perform vectorized synchronization
+        sync_df: pd.DataFrame = find_nearest_kinematics(
             image_timestamps, kinematics_df
         )
 
-        # Remove outliers
-        filtered_sync_results, outliers = remove_outliers(
-            sync_results, max_time_diff_ms
-        )
+        # Remove outliers (vectorized mask)
+        filtered_df, n_outliers = remove_outliers(sync_df, max_time_diff_ms)
 
         # Determine output directory
         if save_results:
@@ -783,21 +622,12 @@ def process_episode_sync(
             out_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Output directory: {out_dir}")
 
-            # Save all results
-            save_sync_results(
-                sync_results, str(out_dir / "sync_results_original.csv")
-            )
-            save_sync_results(
-                filtered_sync_results, str(out_dir / "sync_results_filtered.csv")
-            )
-
-            if outliers:
-                save_sync_results(outliers, str(out_dir / "sync_results_outliers.csv"))
+            # Save results
+            save_sync_results(sync_df, str(out_dir / "sync_results_original.csv"))
+            save_sync_results(filtered_df, str(out_dir / "sync_results_filtered.csv"))
 
             # Save valid filenames list
-            valid_filenames: List[str] = get_valid_image_filenames(
-                filtered_sync_results
-            )
+            valid_filenames: List[str] = get_valid_image_filenames(filtered_df)
             filenames_path: Path = out_dir / "valid_image_filenames.txt"
 
             with open(filenames_path, "w") as f:
@@ -809,21 +639,21 @@ def process_episode_sync(
             # Generate plot if requested
             if plot:
                 logger.info("Generating synchronization plot")
-                plot_time_differences(filtered_sync_results, str(out_dir))
+                plot_time_differences(filtered_df, str(out_dir))
         else:
             # In-memory only mode
             out_dir = None
-            valid_filenames = get_valid_image_filenames(filtered_sync_results)
+            valid_filenames = get_valid_image_filenames(filtered_df)
             logger.debug("Skipping file saves (save_results=False)")
 
         # Prepare return dictionary
         result: Dict[str, Any] = {
             "success": True,
             "valid_filenames": valid_filenames,
-            "sync_df": pd.DataFrame(filtered_sync_results),
+            "sync_df": filtered_df,
             "sync_output_dir": out_dir,
             "num_valid_images": len(valid_filenames),
-            "outliers_removed": len(outliers),
+            "outliers_removed": n_outliers,
         }
 
         logger.info(f"Processing completed successfully")

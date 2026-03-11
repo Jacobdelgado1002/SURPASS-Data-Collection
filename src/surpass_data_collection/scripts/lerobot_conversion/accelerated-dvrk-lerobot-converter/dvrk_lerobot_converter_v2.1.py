@@ -223,10 +223,21 @@ class FrameInfo:
 # UTILITY FUNCTIONS
 # =============================================================================
 _FRAME_TS_RE = re.compile(r'frame(\d+)')
+_NEW_FORMAT_RE = re.compile(r'frame\d+_(?:left|right|psm1|psm2)_(\d+)_(\d+)\.jpg')
 
 
 def extract_timestamp(filename: str) -> int:
-    """Extract timestamp from filename like 'frame1767971796430639266_psm1.jpg'"""
+    """Extract nanosecond timestamp from frame filename.
+
+    Supports both old ('frame{ts}_{cam}.jpg') and new
+    ('frame{seq}_{cam}_{sec}_{nsec}.jpg') formats.
+    """
+    # Try new format first (more specific)
+    new_match = _NEW_FORMAT_RE.search(filename)
+    if new_match:
+        return int(new_match.group(1)) * 1_000_000_000 + int(new_match.group(2))
+
+    # Fall back to old format
     match = _FRAME_TS_RE.search(filename)
     if match:
         return int(match.group(1))

@@ -459,30 +459,6 @@ def find_subject_directories(root_dir: str) -> List[str]:
     return subject_dirs
 
 
-def get_next_video_index(out_dir: str) -> int:
-    """
-    Scan the output directory to find the highest existing video sequence number.
-    Returns the next available index.
-    """
-    if not os.path.exists(out_dir):
-        return 0
-        
-    pattern = re.compile(r"Cholecystectomy_tissue(\d{6})\.mp4")
-    max_idx = -1
-    
-    try:
-        with os.scandir(out_dir) as it:
-            for entry in it:
-                if entry.is_file():
-                    match = pattern.match(entry.name)
-                    if match:
-                        idx = int(match.group(1))
-                        if idx > max_idx:
-                            max_idx = idx
-    except OSError:
-        pass
-                
-    return max_idx + 1
 
 
 # ---------------------------------------------------------------------
@@ -604,15 +580,16 @@ def main() -> None:
         logger.error(f"No subject directories found in {root_dir}")
         sys.exit(1)
 
-    # Ensure output directory exists to scan for next index
+    # Ensure output directory exists
     os.makedirs(out_dir, exist_ok=True)
-    next_video_index = get_next_video_index(out_dir)
-    print(f"Starting video index for new outputs: {next_video_index:06d}")
 
     # Collect all tasks (runs) to process
+    # Build provenance-based video names: Cholec_{subject}_{tissue}_{session}.mp4
     tasks: List[Tuple[str, str, int]] = []
     
     for subject in subject_dirs:
+        subject_name: str = os.path.basename(subject)
+
         try:
             with os.scandir(subject) as it:
                 tissue_dirs = sorted([e.path for e in it if e.is_dir()])
@@ -620,6 +597,8 @@ def main() -> None:
             continue
             
         for tissue in tissue_dirs:
+            tissue_name: str = os.path.basename(tissue).replace("#", "")
+
             try:
                 with os.scandir(tissue) as it:
                     run_dirs = sorted([e.path for e in it if e.is_dir()])
@@ -627,15 +606,17 @@ def main() -> None:
                 continue
                 
             for run in run_dirs:
+                run_name: str = os.path.basename(run)
+                video_name: str = f"Cholec_{subject_name}_{tissue_name}_{run_name}.mp4"
+
                 for cam in CAM_LIST:
                     img_dir = os.path.join(run, cam)
                     if os.path.isdir(img_dir):
-                        out_video = os.path.join(out_dir, f"Cholecystectomy_tissue{next_video_index:06d}.mp4")
+                        out_video = os.path.join(out_dir, video_name)
                         if not os.path.exists(out_video) or overwrite:
                             tasks.append((img_dir, out_video, fps))
                         else:
                             print(f"Skipping existing video (use --overwrite to replace): {out_video}")
-                        next_video_index += 1
 
     # Dry run mode - just list what would be processed
     if dry_run:
