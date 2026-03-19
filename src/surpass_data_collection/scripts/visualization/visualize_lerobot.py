@@ -37,17 +37,16 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont, QKeySequence
 import pyqtgraph as pg
 
-# Try OpenGL 3D support; fall back to matplotlib if unavailable
+# Always use matplotlib for the 3D trajectory to provide the XYZ axes bounding box
+HAS_GL = False
 try:
-    import pyqtgraph.opengl as gl
-    HAS_GL = True
+    import pyqtgraph.opengl as gl  # Keep available in case it's used elsewhere, but not for trajectory widget
 except Exception:
-    HAS_GL = False
+    pass
 
-if not HAS_GL:
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
-    from matplotlib.figure import Figure
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 
 # ─── Color Palette (Catppuccin Mocha) ────────────────────────────────────────
