@@ -479,6 +479,112 @@ def slice_ee_csv(
     return rows_written, "ok"
 
 
+def slice_ee_csv_by_timestamps(
+    src_csv: Path,
+    out_csv: Path,
+    image_timestamps: np.ndarray,
+) -> Tuple[int, str]:
+    """
+    Slice kinematic CSV using timestamp-based nearest-neighbor alignment.
+
+    For each image timestamp, finds the temporally nearest CSV row and
+    writes that row to the output. This ensures 1:1 alignment between
+    image frames and kinematic data, eliminating the timing offset that
+    occurs when using raw row indices.
+
+    Args:
+        src_csv: Path to source CSV file containing kinematic data with
+            a 'timestamp' column (nanoseconds).
+        out_csv: Path where aligned CSV should be written.
+        image_timestamps: Array of nanosecond timestamps for each image
+            frame in the sliced episode (must be sorted chronologically).
+
+    Returns:
+        Tuple of (rows_written, status) where:
+            - rows_written: Number of data rows written (one per image)
+            - status: One of 'ok', 'missing', 'empty', or 'error'
+
+    Notes:
+        - Uses binary search (np.searchsorted) for O(n log m) matching
+        - Each image gets exactly one matched CSV row
+        - Duplicate CSV rows are allowed (when images are closer together
+          than CSV samples)
+        - Preserves CSV header in output
+    """
+    logger.debug(
+        f"Timestamp-aligned CSV slice: {src_csv} -> {out_csv}, "
+        f"{len(image_timestamps)} image frames"
+    )
+
+    if not src_csv.exists():
+        logger.warning(f"Source CSV not found: {src_csv}")
+        return 0, "missing"
+
+    try:
+        import pandas as pd
+
+        df = pd.read_csv(src_csv)
+
+        if df.empty:
+            logger.warning(f"Source CSV is empty: {src_csv}")
+            return 0, "empty"
+
+        # Find the timestamp column
+        timestamp_cols = [
+            col for col in df.columns
+            if "time" in col.lower() or "stamp" in col.lower()
+        ]
+
+        if not timestamp_cols:
+            logger.warning(
+                f"No timestamp column found in CSV, "
+                f"falling back to index-based slicing"
+            )
+            # Fall back to index-based slicing if no timestamp column
+            start_idx = 0
+            end_idx = len(image_timestamps) - 1
+            return slice_ee_csv(src_csv, out_csv, start_idx, end_idx)
+
+        ts_col = timestamp_cols[0]
+        csv_timestamps = df[ts_col].values.astype(np.int64)
+
+        # For each image timestamp, find the nearest CSV row
+        idx = np.searchsorted(csv_timestamps, image_timestamps)
+        idx = np.clip(idx, 0, len(csv_timestamps) - 1)
+
+        # Check if previous index is closer
+        prev = np.clip(idx - 1, 0, len(csv_timestamps) - 1)
+        diff_curr = np.abs(csv_timestamps[idx] - image_timestamps)
+        diff_prev = np.abs(csv_timestamps[prev] - image_timestamps)
+        best_idx = np.where(diff_prev < diff_curr, prev, idx)
+
+        # Log alignment quality
+        matched_diffs_ms = (
+            image_timestamps - csv_timestamps[best_idx]
+        ).astype(np.float64) / 1e6
+        logger.info(
+            f"CSV timestamp alignment: mean={matched_diffs_ms.mean():.2f}ms, "
+            f"std={matched_diffs_ms.std():.2f}ms, "
+            f"max|diff|={np.abs(matched_diffs_ms).max():.2f}ms"
+        )
+
+        # Extract matched rows and write
+        aligned_df = df.iloc[best_idx].reset_index(drop=True)
+
+        ensure_dir(out_csv.parent)
+        aligned_df.to_csv(out_csv, index=False)
+
+        rows_written = len(aligned_df)
+        logger.info(f"Wrote {rows_written} timestamp-aligned CSV rows to: {out_csv}")
+        return rows_written, "ok"
+
+    except Exception as e:
+        logger.error(
+            f"Timestamp-aligned CSV slice failed: {e}", exc_info=True
+        )
+        return 0, "error"
+
+
 # ---------------------------------------------------------------------
 # File Operations
 # ---------------------------------------------------------------------
@@ -889,14 +995,16 @@ def process_episode(
                     logger.debug(f"Copy task failed: {e}")
                     missing_count += 1
 
-    # Step 6: Slice kinematic CSV
+    # Step 6: Slice kinematic CSV (timestamp-aligned)
     ee_csv_src: Path = src_session_dir / KINEMATIC_CSV_NAME
     ee_csv_dst: Path = dst_base / KINEMATIC_CSV_NAME
 
     ee_rows: int = 0
     if not ee_csv_dst.exists() or overwrite:
-        ee_rows, status = slice_ee_csv(
-            ee_csv_src, ee_csv_dst, new_start_idx, new_end_idx
+        # Get timestamps for the sliced image frames for alignment
+        sliced_image_ts = src_timestamps[new_start_idx:new_end_idx + 1]
+        ee_rows, status = slice_ee_csv_by_timestamps(
+            ee_csv_src, ee_csv_dst, sliced_image_ts
         )
         logger.debug(f"CSV slicing: {ee_rows} rows, status: {status}")
 
