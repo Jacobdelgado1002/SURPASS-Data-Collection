@@ -55,23 +55,18 @@ Synchronization Strategy:
     - Ensures 1:1 correspondence across all modalities
 
 Usage:
-    # Basic filtering with defaults
-    python3 filter_episodes.py /source /destination
-
-    # Custom synchronization threshold
-    python3 filter_episodes.py /source /out --max-time-diff 50.0
-
-    # Require minimum valid images per episode
-    python3 filter_episodes.py /source /out --min-images 100
-
-    # Dry run to preview processing
-    python3 filter_episodes.py /source /out --dry-run
-
-    # Parallel processing with 8 workers
-    python3 filter_episodes.py /source /out --workers 8
-
-    # Use hardlinks for faster processing (same filesystem required)
-    python3 filter_episodes.py /source /out --hardlink
+Usage:
+    # Library usage
+    from filter_episodes import run_filter_episodes
+    
+    # Process dataset
+    run_filter_episodes(
+        source_dir="/source",
+        out_dir="/destination",
+        max_time_diff=30.0,
+        min_images=10,
+        workers=8
+    )
 
 Notes:
     - Uses direct import of sync_image_kinematics (no subprocess overhead)
@@ -82,7 +77,6 @@ Notes:
     - Maintains original directory structure in destination
 """
 
-import argparse
 import os
 import shutil
 import sys
@@ -301,10 +295,7 @@ def run_sync_analysis_direct(
     result: Dict[str, Any] = process_episode_sync(
         episode_path=episode_path,
         camera="left",
-        output_dir=None,
         max_time_diff_ms=max_time_diff,
-        plot=False,
-        save_results=False,
     )
 
     if result["success"]:
@@ -740,10 +731,7 @@ def run_filter_episode(
     sync_result = process_episode_sync(
         episode_path=episode_path,
         camera="left",
-        output_dir=None,
         max_time_diff_ms=max_time_diff_ms,
-        plot=False,
-        save_results=False,
     )
 
     if not sync_result["success"]:
@@ -1201,139 +1189,3 @@ def run_filter_episodes(
     logger.info(f"Total images copied: {stats['total_images_copied']}")
 
     return 0
-
-# ---------------------------------------------------------------------
-# Main Entry Point
-# ---------------------------------------------------------------------
-
-
-def main() -> int:
-    """
-    Main entry point for command-line usage.
-
-    Parses arguments, discovers episodes, processes them in parallel,
-    and displays comprehensive statistics.
-
-    Command-line Arguments:
-        source_dir: Source directory containing episodes (required)
-        out_dir: Destination directory for filtered data (required)
-        --sync-script: Legacy arg, unused (kept for compatibility)
-        --max-time-diff: Sync threshold in ms (default: 30.0)
-        --min-images: Minimum images per episode (default: 10)
-        --dry-run: Preview without copying (default: False)
-        --workers: Number of parallel workers (default: CPU count)
-        --hardlink: Use hardlinks instead of copying (default: False)
-        --overwrite: Overwrite existing destinations (default: False)
-
-    Exit Codes:
-        0: Success (all processing completed)
-        1: Error (invalid arguments or source not found)
-
-    Examples:
-        # Basic usage
-        $ python3 filter_episodes.py /source /out
-
-        # Custom settings
-        $ python3 filter_episodes.py /source /out \
-            --max-time-diff 50.0 --min-images 100 --workers 8
-
-        # Dry run to preview
-        $ python3 filter_episodes.py /source /out --dry-run
-
-    Output:
-        - Progress bar with real-time statistics
-        - Final summary with counts and skip reasons
-        - List of skipped episodes with reasons
-
-    Notes:
-        - Uses ProcessPoolExecutor for parallel processing
-        - Limits workers to MAX_WORKERS to avoid overload
-        - Progress bar shows copied/skipped/images in real-time
-        - Gracefully handles Ctrl+C interruption
-        - Comprehensive error logging
-    """
-    parser = argparse.ArgumentParser(
-        description="Filter and copy synchronized episodes with multi-camera support",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-    Examples:
-    %(prog)s /source /out
-    %(prog)s /source /out --max-time-diff 50.0 --min-images 100
-    %(prog)s /source /out --dry-run --workers 8
-    %(prog)s /source /out --hardlink --overwrite
-
-    This script enforces strict multi-camera synchronization: frames are kept
-    only if ALL cameras have matching frames within the time threshold.
-            """,
-        )
-
-    parser.add_argument(
-        "source_dir",
-        help="Source directory containing episodes",
-    )
-
-    parser.add_argument(
-        "out_dir",
-        help="Destination directory for filtered episodes",
-    )
-
-    parser.add_argument(
-        "--sync_script",
-        default="",
-        help="Legacy parameter (unused, kept for compatibility)",
-    )
-
-    parser.add_argument(
-        "--max_time_diff",
-        type=float,
-        default=DEFAULT_MAX_TIME_DIFF_MS,
-        help=f"Maximum time difference in ms (default: {DEFAULT_MAX_TIME_DIFF_MS})",
-    )
-
-    parser.add_argument(
-        "--min_images",
-        type=int,
-        default=DEFAULT_MIN_IMAGES,
-        help=f"Minimum valid images required (default: {DEFAULT_MIN_IMAGES})",
-    )
-
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Preview processing without copying files",
-    )
-
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=None,
-        help="Number of parallel workers (default: CPU count, max: 8)",
-    )
-
-    parser.add_argument(
-        "--hardlink",
-        action="store_true",
-        help="Use hardlinks instead of copying (faster, requires same filesystem)",
-    )
-
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing episodes in destination",
-    )
-
-    args = parser.parse_args()
-
-    return run_filter_episodes(
-        source_dir=Path(args.source_dir),
-        out_dir=Path(args.out_dir),
-        max_time_diff=args.max_time_diff,
-        min_images=args.min_images,
-        dry_run=args.dry_run,
-        workers=args.workers,
-        use_hardlink=args.hardlink,
-        overwrite=args.overwrite,
-    )
-
-if __name__ == "__main__":
-    sys.exit(main())

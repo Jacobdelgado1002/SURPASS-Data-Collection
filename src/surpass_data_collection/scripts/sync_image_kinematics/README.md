@@ -35,8 +35,7 @@ sync_image_kinematics/
 - Timestamp extraction from image filenames
 - Nearest-neighbor matching with kinematic data (binary search)
 - Outlier detection and removal
-- Synchronization quality visualization
-- Can be used as library (no subprocess overhead)
+- In-memory data processing designed for automated pipelines
 
 **Use Cases**:
 - Analyzing synchronization quality of a single episode
@@ -44,25 +43,7 @@ sync_image_kinematics/
 - Generating synchronization reports for QA
 - Imported by filter_episodes.py for batch processing
 
-**Command-Line Interface**:
-
-```bash
-# Basic analysis of left camera
-python sync_image_kinematics.py /path/to/episode --camera left
-
-# Custom synchronization threshold
-python sync_image_kinematics.py /path/to/episode --camera left \
-    --max-time-diff 50.0
-
-# Specify output directory for results
-python sync_image_kinematics.py /path/to/episode --camera left \
-    --output-dir sync_results
-
-# Analyze different camera view
-python sync_image_kinematics.py /path/to/episode --camera psm1
-```
-
-**Library Usage** (Recommended for programmatic access):
+**Library Usage**:
 
 ```python
 from sync_image_kinematics import process_episode_sync
@@ -70,9 +51,7 @@ from sync_image_kinematics import process_episode_sync
 result = process_episode_sync(
     episode_path="/data/episode_001",
     camera="left",
-    max_time_diff_ms=30.0,
-    plot=False,           # Skip plotting for batch processing
-    save_results=False    # In-memory only (faster)
+    max_time_diff_ms=30.0
 )
 
 if result['success']:
@@ -96,16 +75,6 @@ episode_dir/
 └── ee_csv.csv         # Kinematic data with timestamp column
 ```
 
-**Output Files** (when save_results=True):
-```
-episode_dir/sync_analysis/
-├── sync_results_original.csv    # All sync results
-├── sync_results_filtered.csv    # After outlier removal
-├── sync_results_outliers.csv    # Removed outliers
-├── valid_image_filenames.txt    # List of valid filenames
-└── sync_analysis.png            # Visualization (if plot=True)
-```
-
 **Processing Pipeline**:
 
 1. **Timestamp Extraction**: Parse nanosecond timestamps from image filenames
@@ -113,7 +82,7 @@ episode_dir/sync_analysis/
 3. **Nearest-Neighbor Matching**: Binary search to find closest kinematic point for each image
 4. **Time Difference Calculation**: Compute signed difference in milliseconds
 5. **Outlier Removal**: Filter frames exceeding threshold
-6. **Optional Visualization**: Generate plots showing sync quality
+6. **In-Memory Return**: Return clean sync dictionary for downstream processing
 
 **Timestamp Detection**:
 
@@ -150,36 +119,27 @@ Default threshold: **30ms**
 | psm1 | endo_psm1 | _psm1 |
 | psm2 | endo_psm2 | _psm2 |
 
-**Options**:
+**Function Arguments**:
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `episode_path` | Path | Required | Episode directory to analyze |
-| `--camera` | str | left | Camera view (left/right/psm1/psm2) |
-| `--output-dir` | Path | sync_analysis | Output directory for results |
-| `--max-time-diff` | float | 30.0 | Max time diff threshold (ms) |
-| `--csv-filename` | str | ee_csv.csv | Kinematic CSV filename |
+| `camera` | str | left | Camera view (left/right/psm1/psm2) |
+| `max_time_diff_ms` | float | 30.0 | Max time diff threshold (ms) |
+| `csv_filename` | str | ee_csv.csv | Kinematic CSV filename |
 
-**Return Dictionary** (programmatic usage):
+**Return Dictionary**:
 
 ```python
 {
     'success': bool,                    # Processing succeeded
     'valid_filenames': List[str],       # Filenames within threshold
     'sync_df': pd.DataFrame,            # Filtered sync DataFrame
-    'sync_output_dir': Path,            # Output directory (if saved)
     'num_valid_images': int,            # Count of valid images
     'outliers_removed': int,            # Count of outliers
     'error': str                        # Error message (if success=False)
 }
 ```
-
-**Visualization Output**:
-
-The generated plot (when `--plot` enabled) shows:
-1. **Time series**: Time differences over image sequence
-2. **Histogram**: Distribution of time differences
-3. **Statistics**: Mean, std, and max absolute difference
 
 ---
 
@@ -201,26 +161,19 @@ The generated plot (when `--plot` enabled) shows:
 - Creating synchronized subsets of large datasets
 - Quality control for data collection
 
-**Command-Line Interface**:
+**Library Integration**:
 
-```bash
-# Basic filtering with defaults (30ms threshold)
-python filter_episodes.py /source /destination
+```python
+from filter_episodes import run_filter_episodes
 
-# Custom synchronization threshold
-python filter_episodes.py /source /output --max-time-diff 50.0
-
-# Require minimum valid images per episode
-python filter_episodes.py /source /output --min-images 100
-
-# Dry run to preview processing
-python filter_episodes.py /source /output --dry-run
-
-# Parallel processing with 8 workers
-python filter_episodes.py /source /output --workers 8
-
-# Use hardlinks for faster processing (same filesystem required)
-python filter_episodes.py /source /output --hardlink
+# Process dataset
+run_filter_episodes(
+    source_dir="/source",
+    out_dir="/destination",
+    max_time_diff=30.0,
+    min_images=10,
+    workers=8
+)
 ```
 
 **Input Structure**:
@@ -400,19 +353,14 @@ python filter_episodes.py /raw /filtered --dry-run
 The recommended synchronization workflow:
 
 ```bash
-# Step 1: Analyze single episode to understand sync quality
-python sync_image_kinematics.py /raw/tissue_1/session_1 --camera left
-
-# Review sync_analysis.png to determine appropriate threshold
-
-# Step 2: Filter entire dataset with chosen threshold
-python filter_episodes.py /raw /filtered \
-    --max-time-diff 30.0 \
-    --workers 8 \
-    --hardlink
-
-# Step 3: Proceed to slicing and reformatting
-python ../post_processing/slice_affordance.py --source_dataset_dir filtered
+# Run the full end-to-end dataset conversion (handles filtering, video-generation, and LeRobot packaging)
+conda run -n autonomous_surgery python src/surpass_data_collection/scripts/lerobot_conversion/accelerated-dvrk-lerobot-converter/dvrk_lerobot_converter_v2.1.py \
+    --source-dir /raw \
+    --output-dir /filtered \
+    --dataset-name my_dataset \
+    --annotations-dir /annotations \
+    --fps 30 \
+    --workers 8
 ```
 
 ---
@@ -587,7 +535,7 @@ episodes = [...]  # List of episode paths
 results = []
 
 for ep in episodes:
-    res = process_episode_sync(ep, save_results=False)
+    res = process_episode_sync(ep)
     if res['success']:
         results.append({
             'episode': ep.name,

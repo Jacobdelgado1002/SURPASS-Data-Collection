@@ -28,20 +28,6 @@ Algorithm (per episode):
     6. Overwrite ``ee_csv.csv`` with only the kept rows, and delete image
        files outside the kept range from every camera directory.
 
-Usage:
-    # Preview trim decisions (no files touched)
-    python remove_stationary_frames.py --data-path dataset_sliced --dry-run
-
-    # Trim with default threshold
-    python remove_stationary_frames.py --data-path dataset_sliced
-
-    # Custom threshold & minimum length
-    python remove_stationary_frames.py --data-path dataset_sliced \\
-        --threshold 5e-4 --min-episode-length 20
-
-    # Parallel processing
-    python remove_stationary_frames.py --data-path dataset_sliced --workers 8
-
 Programmatic API:
     from remove_stationary_frames import run_remove_stationary_frames
 
@@ -54,9 +40,7 @@ Programmatic API:
     )
 """
 
-import argparse
 import os
-import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -446,139 +430,4 @@ def run_remove_stationary_frames(
     return all_stats
 
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 
-
-def print_summary(stats: List[Dict]) -> None:
-    """Print a human-readable summary table."""
-    if not stats:
-        print("No episodes processed.")
-        return
-
-    total = len(stats)
-    trimmed = sum(1 for s in stats if not s["skipped"] and s["reason"] == "trimmed")
-    no_change = sum(
-        1 for s in stats if not s["skipped"] and s["reason"] != "trimmed"
-    )
-    skipped = sum(1 for s in stats if s["skipped"])
-    total_original = sum(s["original_length"] for s in stats)
-    total_kept = sum(s["trimmed_length"] for s in stats if not s["skipped"])
-    total_removed = sum(
-        s["start_removed"] + s["end_removed"]
-        for s in stats
-        if not s["skipped"]
-    )
-
-    print(f"\n{'=' * 70}")
-    print("Stationary Frame Removal — Summary")
-    print(f"{'=' * 70}")
-    print(f"  Episodes processed  : {total}")
-    print(f"  Trimmed             : {trimmed}")
-    print(f"  No change needed    : {no_change}")
-    print(f"  Skipped             : {skipped}")
-    print(f"  Total original rows : {total_original}")
-    print(f"  Total kept rows     : {total_kept}")
-    print(f"  Total removed rows  : {total_removed}")
-    if total_original > 0:
-        pct = 100.0 * total_removed / total_original
-        print(f"  Removal percentage  : {pct:.1f}%")
-    print(f"{'=' * 70}")
-
-    # Per-episode detail for trimmed ones
-    any_trimmed = [s for s in stats if s["reason"] in ("trimmed", "dry-run")]
-    if any_trimmed:
-        print(f"\n{'Episode':<60} {'Orig':>6} {'Kept':>6} {'Head':>6} {'Tail':>6}")
-        print("-" * 90)
-        for s in any_trimmed:
-            name = Path(s["episode"]).name
-            parent = Path(s["episode"]).parent.name
-            label = f"{parent}/{name}"
-            print(
-                f"{label:<60} {s['original_length']:>6} "
-                f"{s['trimmed_length']:>6} "
-                f"{s['start_removed']:>6} "
-                f"{s['end_removed']:>6}"
-            )
-    print()
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Trim stationary head/tail segments from sliced surgical-robot "
-            "episodes by analysing joint-space motion."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    parser.add_argument(
-        "--data-path",
-        type=Path,
-        required=True,
-        help="Root directory of the sliced dataset (contains tissue_*/…/episode_*/ee_csv.csv).",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=DEFAULT_THRESHOLD,
-        help=(
-            f"L2 delta threshold for motion detection (default: {DEFAULT_THRESHOLD}). "
-            "A frame is 'moving' if the L2 norm of the joint-space difference "
-            "vector exceeds this value."
-        ),
-    )
-    parser.add_argument(
-        "--min-episode-length",
-        type=int,
-        default=DEFAULT_MIN_EPISODE_LENGTH,
-        help=(
-            f"Minimum number of frames to keep after trimming (default: "
-            f"{DEFAULT_MIN_EPISODE_LENGTH}). Episodes that would become "
-            f"shorter are skipped."
-        ),
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=DEFAULT_WORKERS,
-        help=f"Number of parallel workers (default: {DEFAULT_WORKERS}).",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview trim decisions without modifying any files.",
-    )
-
-    args = parser.parse_args()
-
-    if not args.data_path.is_dir():
-        print(f"Error: {args.data_path} is not a directory.", file=sys.stderr)
-        return 1
-
-    print(f"Data path      : {args.data_path}")
-    print(f"Threshold      : {args.threshold}")
-    print(f"Min ep length  : {args.min_episode_length}")
-    print(f"Workers        : {args.workers}")
-    print(f"Dry run        : {args.dry_run}")
-
-    stats = run_remove_stationary_frames(
-        base_dir=args.data_path,
-        threshold=args.threshold,
-        min_episode_length=args.min_episode_length,
-        workers=args.workers,
-        dry_run=args.dry_run,
-    )
-
-    print_summary(stats)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

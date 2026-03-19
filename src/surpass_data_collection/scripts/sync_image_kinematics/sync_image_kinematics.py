@@ -9,8 +9,8 @@ kinematic (end-effector position/velocity) data points based on timestamp proxim
 It handles timestamp extraction from filenames, nearest-neighbor matching, outlier
 removal, and optional visualization of synchronization quality.
 
-The module can be used both as a library (imported by other scripts) and as a
-standalone CLI tool for analyzing individual episodes.
+The module is designed as a library to be imported by other scripts in the data
+processing pipeline for performing automated temporal alignment.
 
 Data Structure Expected:
     episode_dir/
@@ -35,17 +35,10 @@ Processing Pipeline:
     3. Find nearest kinematic data point for each image
     4. Calculate time differences
     5. Remove outliers beyond threshold
-    6. Optionally visualize and save results
+    6. Return in-memory synchronization dictionary for downstream use
 
 Usage:
-    # CLI usage for single episode
-    python3 sync_image_kinematics.py /path/to/episode --camera left
-
-    # With custom settings
-    python3 sync_image_kinematics.py /path/to/episode --camera left \
-        --max-time-diff 50.0 --output-dir results
-
-    # Library usage (no subprocess overhead)
+    # Library usage
     from sync_image_kinematics import process_episode_sync
     result = process_episode_sync(
         episode_path="/data/episode_001",
@@ -63,15 +56,12 @@ Notes:
     - Can process any of four camera views: left, right, psm1, psm2
 """
 
-import argparse
-import glob
 import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -97,13 +87,6 @@ DEFAULT_MAX_TIME_DIFF_MS: float = 30.0
 
 # Synthetic timestamp generation frequency (Hz) when timestamps are missing
 SYNTHETIC_TIMESTAMP_FREQ_HZ: int = 30
-
-# Output subdirectory name for synchronization results
-SYNC_OUTPUT_SUBDIR: str = "sync_analysis"
-
-# Plot settings
-PLOT_DPI: int = 300
-PLOT_FIGSIZE: Tuple[int, int] = (12, 10)
 
 # Progress reporting interval for large datasets
 PROGRESS_REPORT_INTERVAL: int = 1000
@@ -398,100 +381,6 @@ def get_valid_image_filenames(sync_df: pd.DataFrame) -> List[str]:
 
 
 # ---------------------------------------------------------------------
-# Visualization Functions
-# ---------------------------------------------------------------------
-
-
-def plot_time_differences(
-    sync_df: pd.DataFrame, output_dir: Optional[str] = None
-) -> None:
-    """
-    Plot time differences between images and kinematic data.
-
-    Args:
-        sync_df: Filtered sync DataFrame with 'time_diff_ms' column.
-        output_dir: Directory to save plots. If None, plot is not saved.
-    """
-    if sync_df.empty:
-        logger.warning("No sync results to plot")
-        return
-
-    logger.info(f"Generating synchronization plot for {len(sync_df)} results")
-
-    time_diffs_ms = sync_df["time_diff_ms"].values
-    image_indices = np.arange(len(sync_df))
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=PLOT_FIGSIZE)
-
-    ax1.plot(image_indices, time_diffs_ms, "b-", alpha=0.7, linewidth=1)
-    ax1.scatter(image_indices, time_diffs_ms, c="red", s=20, alpha=0.6)
-    ax1.set_xlabel("Image Index")
-    ax1.set_ylabel("Time Difference (ms)")
-    ax1.set_title("Time Difference Between Images and Nearest Kinematics Data")
-    ax1.grid(True, alpha=0.3)
-
-    mean_diff = float(np.mean(time_diffs_ms))
-    std_diff = float(np.std(time_diffs_ms))
-    max_diff = float(np.max(np.abs(time_diffs_ms)))
-
-    stats_text = (
-        f"Mean: {mean_diff:.2f} ms\n"
-        f"Std: {std_diff:.2f} ms\n"
-        f"Max |diff|: {max_diff:.2f} ms"
-    )
-    ax1.text(
-        0.02, 0.98, stats_text, transform=ax1.transAxes,
-        verticalalignment="top",
-        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
-    )
-
-    ax2.hist(time_diffs_ms, bins=50, alpha=0.7, color="skyblue", edgecolor="black")
-    ax2.axvline(
-        mean_diff, color="red", linestyle="--", linewidth=2,
-        label=f"Mean: {mean_diff:.2f} ms",
-    )
-    ax2.set_xlabel("Time Difference (ms)")
-    ax2.set_ylabel("Frequency")
-    ax2.set_title("Distribution of Time Differences")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        plot_path = os.path.join(output_dir, "sync_analysis.png")
-        plt.savefig(plot_path, dpi=PLOT_DPI, bbox_inches="tight")
-        logger.info(f"Plot saved to: {plot_path}")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------
-# File I/O Functions
-# ---------------------------------------------------------------------
-
-
-def save_sync_results(sync_df: pd.DataFrame, output_file: str) -> None:
-    """
-    Save synchronization results DataFrame to CSV file.
-
-    Args:
-        sync_df: Sync results DataFrame.
-        output_file: Path where CSV should be written.
-    """
-    logger.debug(f"Saving {len(sync_df)} sync results to: {output_file}")
-    output_path: Path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        sync_df.to_csv(output_file, index=False)
-        logger.info(f"Saved sync results to: {output_file}")
-    except Exception as e:
-        logger.error(f"Failed to save sync results to {output_file}: {e}", exc_info=True)
-        raise
-
-
-# ---------------------------------------------------------------------
 # High-Level Processing Functions
 # ---------------------------------------------------------------------
 
@@ -499,11 +388,8 @@ def save_sync_results(sync_df: pd.DataFrame, output_file: str) -> None:
 def process_episode_sync(
     episode_path: Union[str, Path],
     camera: str = "left",
-    output_dir: Optional[str] = None,
     csv_filename: str = DEFAULT_CSV_FILENAME,
     max_time_diff_ms: float = DEFAULT_MAX_TIME_DIFF_MS,
-    plot: bool = False,
-    save_results: bool = True,
 ) -> Dict[str, Any]:
     """
     Process a single episode to synchronize images and kinematics.
@@ -517,15 +403,9 @@ def process_episode_sync(
             and kinematic CSV.
         camera: Camera view to analyze. Must be one of: "left", "right",
             "psm1", "psm2". Default is "left".
-        output_dir: Directory to save results. If None, creates
-            'sync_analysis' subdirectory in episode_path.
         csv_filename: Name of kinematic CSV file. Default is "ee_csv.csv".
         max_time_diff_ms: Maximum time difference threshold for outlier
             removal in milliseconds. Default is 30.0.
-        plot: Whether to generate and save visualization plots.
-            Default is False (skip plotting for batch processing speed).
-        save_results: Whether to save CSV results and filenames to disk.
-            Default is True. Set to False for in-memory processing only.
 
     Returns:
         Dictionary containing synchronization results:
@@ -612,46 +492,15 @@ def process_episode_sync(
         # Remove outliers (vectorized mask)
         filtered_df, n_outliers = remove_outliers(sync_df, max_time_diff_ms)
 
-        # Determine output directory
-        if save_results:
-            if output_dir:
-                out_dir: Path = Path(output_dir)
-            else:
-                out_dir = episode_path / SYNC_OUTPUT_SUBDIR
-
-            out_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Output directory: {out_dir}")
-
-            # Save results
-            save_sync_results(sync_df, str(out_dir / "sync_results_original.csv"))
-            save_sync_results(filtered_df, str(out_dir / "sync_results_filtered.csv"))
-
-            # Save valid filenames list
-            valid_filenames: List[str] = get_valid_image_filenames(filtered_df)
-            filenames_path: Path = out_dir / "valid_image_filenames.txt"
-
-            with open(filenames_path, "w") as f:
-                for filename in valid_filenames:
-                    f.write(f"{filename}\n")
-
-            logger.info(f"Saved valid filenames to: {filenames_path}")
-
-            # Generate plot if requested
-            if plot:
-                logger.info("Generating synchronization plot")
-                plot_time_differences(filtered_df, str(out_dir))
-        else:
-            # In-memory only mode
-            out_dir = None
-            valid_filenames = get_valid_image_filenames(filtered_df)
-            logger.debug("Skipping file saves (save_results=False)")
+        # Extraction in-memory valid filenames
+        valid_filenames = get_valid_image_filenames(filtered_df)
 
         # Prepare return dictionary
         result: Dict[str, Any] = {
             "success": True,
             "valid_filenames": valid_filenames,
             "sync_df": filtered_df,
-            "sync_output_dir": out_dir,
+            "sync_output_dir": None,
             "num_valid_images": len(valid_filenames),
             "outliers_removed": n_outliers,
         }
@@ -666,133 +515,3 @@ def process_episode_sync(
         error_msg: str = f"Processing failed: {str(e)}"
         logger.error(error_msg, exc_info=True)
         return {"success": False, "error": error_msg}
-
-
-# ---------------------------------------------------------------------
-# Main Entry Point (CLI)
-# ---------------------------------------------------------------------
-
-
-def main() -> int:
-    """
-    Main entry point for command-line usage.
-
-    Parses command-line arguments and delegates to process_episode_sync()
-    for the actual processing. Provides user-friendly CLI interface with
-    validation and helpful error messages.
-
-    Command-line Arguments:
-        episode_path: Positional argument specifying episode directory. Required.
-        --camera: Camera view to analyze. Default: "left".
-        --output-dir: Directory to save results. Default: episode/sync_analysis.
-        --csv-file: Kinematic CSV filename. Default: "ee_csv.csv".
-        --max-time-diff: Maximum time difference in ms. Default: 30.0.
-
-    Exit Codes:
-        0: Success (processing completed without errors)
-        1: Failure (error during processing)
-
-    Examples:
-        # Basic usage
-        $ python3 sync_image_kinematics.py /data/episode_001
-
-        # Custom camera and threshold
-        $ python3 sync_image_kinematics.py /data/episode_001 --camera right \
-            --max-time-diff 50.0
-
-        # Save to custom directory
-        $ python3 sync_image_kinematics.py /data/episode_001 \
-            --output-dir /results/sync
-
-    Notes:
-        - Always generates plots in CLI mode (plot=True)
-        - Validates episode path exists before processing
-        - Prints summary statistics on completion
-        - Full error messages logged and displayed
-    """
-    parser = argparse.ArgumentParser(
-        description="Synchronize images with kinematics data using timestamps",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-    Examples:
-    %(prog)s /data/episode_001
-    %(prog)s /data/episode_001 --camera right
-    %(prog)s /data/episode_001 --max-time-diff 50.0 --output-dir /results
-
-    Supported cameras: left, right, psm1, psm2
-            """,
-        )
-
-    parser.add_argument(
-        "episode_path",
-        help="Path to episode directory containing images and CSV",
-    )
-
-    parser.add_argument(
-        "--camera",
-        default="left",
-        choices=list(CAMERA_CONFIGS.keys()),
-        help="Camera to analyze (default: left)",
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        help="Directory to save results and plots (default: episode/sync_analysis)",
-    )
-
-    parser.add_argument(
-        "--csv_file",
-        default=DEFAULT_CSV_FILENAME,
-        help=f"Name of kinematics CSV file (default: {DEFAULT_CSV_FILENAME})",
-    )
-
-    parser.add_argument(
-        "--max_time_diff",
-        type=float,
-        default=DEFAULT_MAX_TIME_DIFF_MS,
-        help=f"Maximum allowed time difference in ms (default: {DEFAULT_MAX_TIME_DIFF_MS})",
-    )
-
-    args = parser.parse_args()
-
-    # Validate episode path exists
-    episode_path: Path = Path(args.episode_path)
-    if not episode_path.exists():
-        logger.error(f"Episode path does not exist: {episode_path}")
-        print(f"Error: Episode path not found: {episode_path}")
-        return 1
-
-    logger.info(f"Starting synchronization for: {episode_path}")
-
-    # Delegate to processing function
-    result: Dict[str, Any] = process_episode_sync(
-        episode_path=episode_path,
-        camera=args.camera,
-        output_dir=args.output_dir,
-        csv_filename=args.csv_file,
-        max_time_diff_ms=args.max_time_diff,
-        plot=True,  # Always plot in CLI mode
-        save_results=True,
-    )
-
-    # Handle result
-    if result["success"]:
-        print("\n" + "=" * 60)
-        print("SYNCHRONIZATION COMPLETED SUCCESSFULLY")
-        print("=" * 60)
-        print(f"Valid images: {result['num_valid_images']}")
-        print(f"Outliers removed: {result['outliers_removed']}")
-        if result["sync_output_dir"]:
-            print(f"Results saved to: {result['sync_output_dir']}")
-        print("=" * 60)
-        return 0
-    else:
-        print("\n" + "=" * 60)
-        print("SYNCHRONIZATION FAILED")
-        print("=" * 60)
-        print(f"Error: {result['error']}")
-        print("=" * 60)
-        return 1
-
-if __name__ == "__main__":
-    sys.exit(main())
