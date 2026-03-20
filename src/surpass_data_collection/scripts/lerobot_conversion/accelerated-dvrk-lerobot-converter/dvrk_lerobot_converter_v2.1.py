@@ -555,7 +555,8 @@ class ConversionWorker:
                     arr = np.array(img)
                     wrist_shape = arr.shape[:2] + (3,)
                 
-                return endo_shape, wrist_shape
+                if left_images and endo_images:
+                    return endo_shape, wrist_shape
             
             return (540, 960, 3), (480, 640, 3)
     # -----------------------------------------------------------------
@@ -634,32 +635,30 @@ class ConversionWorker:
 
 
     # -----------------------------------------------------------------
-    # Pipeline mode: filter → plan → (trim) → convert
+    # Pipeline mode: filter -> plan -> (trim) -> convert
     # -----------------------------------------------------------------
 
     def _trim_stationary_episodes(self, planned):
         """Adjust planned episode indices to remove stationary head/tail.
 
-        Groups episodes by reference session to load each CSV only once.
-        Returns (trimmed_planned, stats_dict).
+        Aligns the reference bounds to the filtered source bounds, then
+        computes stationary trimming on the aligned filtered kinematics.
         """
         from collections import defaultdict
-        import csv as csv_mod
-
-        # Group episode indices by ref_session_dir
-        groups = defaultdict(list)  # ref_dir → [(list_index, start, end), ...]
+        
+        # Group episode indices by src_session_dir (filtered data is 1:1)
+        groups = defaultdict(list)
         for i, (ann, ref, src, dst, start, end) in enumerate(planned):
-            groups[ref].append((i, start, end))
+            groups[src].append((i, start, end, ref))
 
-        trimmed_planned = list(planned)  # shallow copy of the list
+        trimmed_planned = list(planned)
         stats = {"total": len(planned), "trimmed": 0, "frames_removed": 0}
 
-        for ref_dir, episodes_in_session in groups.items():
-            csv_path = ref_dir / CSV_FILE
+        for src_dir, episodes_in_session in groups.items():
+            csv_path = src_dir / CSV_FILE
             if not csv_path.exists():
                 continue
 
-            # Load CSV and compute deltas using optimized pandas engine
             try:
                 full_deltas, _ = compute_deltas(csv_path)
                 if full_deltas is None:
@@ -668,42 +667,75 @@ class ConversionWorker:
                 print(f"  Warning: could not compute deltas for {csv_path}: {e}", file=sys.stderr)
                 continue
 
-            # Trim each episode's range within this session
-            for list_idx, start, end in episodes_in_session:
-                # Extract the delta slice for this episode
-                # deltas[i] = ||row[i+1] - row[i]||, so for rows [start:end]
-                # we need deltas[start : end-1]  (end-1 transitions)
-                d_start = max(start, 0)
-                d_end = min(end, len(full_deltas))  # deltas has len(data)-1 entries
+            # Load src files to get timestamps for alignment
+            src_left_dir = src_dir / LEFT_IMG_DIR
+            src_files = list_sorted_frames(src_left_dir, "_left.jpg")
+            if not src_files:
+                continue
+            src_timestamps = np.array([sa_extract_timestamp(f) for f in src_files], dtype=np.int64)
+
+            # Process each episode
+            for list_idx, start, end, ref_dir in episodes_in_session:
+                # 1. Align ref bounds -> src bounds
+                ref_left_dir = ref_dir / LEFT_IMG_DIR
+                ref_files = list_sorted_frames(ref_left_dir, "_left.jpg")
+                if not ref_files:
+                    continue
+                
+                s_clamped = max(0, min(start, len(ref_files) - 1))
+                e_clamped = max(0, min(end, len(ref_files) - 1))
+                ts_start = sa_extract_timestamp(ref_files[s_clamped])
+                ts_end   = sa_extract_timestamp(ref_files[e_clamped])
+
+                src_start = int(np.searchsorted(src_timestamps, ts_start, side="left"))
+                src_end   = int(np.searchsorted(src_timestamps, ts_end,   side="right")) - 1
+                src_start = max(0, min(src_start, len(src_files) - 1))
+                src_end   = max(0, min(src_end,   len(src_files) - 1))
+                
+                if src_end <= src_start:
+                    continue
+                
+                # 2. Extract deltas and trim
+                d_start = src_start
+                d_end = min(src_end, len(full_deltas))
                 if d_end <= d_start:
                     continue
-
+                
                 ep_deltas = full_deltas[d_start:d_end]
-                ep_n_rows = end - start + 1
+                ep_n_rows = src_end - src_start + 1
 
                 trim_start, trim_end = find_trim_range(ep_deltas, ep_n_rows, self.trim_threshold)
-
-                # No motion detected, or no trim needed
+                
                 if trim_start == 0 and trim_end == ep_n_rows - 1:
                     continue
-
-                new_start = start + trim_start
-                new_end   = start + trim_end
-
-                if new_end - new_start + 1 < 10:  # min episode length
+                
+                trimmed_src_start = src_start + trim_start
+                trimmed_src_end   = src_start + trim_end
+                
+                if trimmed_src_end - trimmed_src_start + 1 < 10:
                     continue
+                
+                # 3. Map back to ref bounds to store in trimmed_planned
+                ts_trimmed_start = src_timestamps[trimmed_src_start]
+                ts_trimmed_end   = src_timestamps[trimmed_src_end]
+                
+                ref_timestamps = np.array([sa_extract_timestamp(f) for f in ref_files], dtype=np.int64)
+                new_start = int(np.searchsorted(ref_timestamps, ts_trimmed_start, side="left"))
+                new_end   = int(np.searchsorted(ref_timestamps, ts_trimmed_end, side="right")) - 1
+                new_start = max(0, min(new_start, len(ref_files) - 1))
+                new_end   = max(0, min(new_end,   len(ref_files) - 1))
 
                 if new_start != start or new_end != end:
                     ann, ref, src, dst, _, _ = trimmed_planned[list_idx]
                     trimmed_planned[list_idx] = (ann, ref, src, dst, new_start, new_end)
-                    removed = ep_n_rows - (new_end - new_start + 1)
+                    removed = ep_n_rows - (trimmed_src_end - trimmed_src_start + 1)
                     stats["trimmed"] += 1
                     stats["frames_removed"] += removed
 
         return trimmed_planned, stats
 
     def _run_pipeline_conversion(self, LeRobotDataset, write_info):
-        """Full pipeline: run_filter_episodes → plan_episodes → accelerated convert."""
+        """Full pipeline: run_filter_episodes -> plan_episodes -> accelerated convert."""
 
         # ---------------------------------------------------------------
         # Stage 1: Filter and synchronise episodes
@@ -748,7 +780,7 @@ class ConversionWorker:
 
         if not planned:
             print(
-                "No episodes planned. Check that annotations, cautery, and "
+                "No episodes planned. Check that annotations, source, and "
                 "filtered data paths are correct.", file=sys.stderr
             )
             sys.exit(1)
@@ -824,7 +856,7 @@ class ConversionWorker:
                 self._process_planned_episode(dataset, ref, src, start, end, subtask_text)
                 t_proc_elapsed = time.time() - t_ep_start
                 print(
-                    f"    → Frame processing complete ({t_proc_elapsed:.1f}s). "
+                    f"    -> Frame processing complete ({t_proc_elapsed:.1f}s). "
                     f"Encoding videos ({VIDEO_CODEC}, parallel)..."
                 )
                 t_enc = time.time()
@@ -908,7 +940,7 @@ class ConversionWorker:
         """Process a single affordance-sliced episode from pre-filtered data.
 
         Reads frames directly from the *filtered session* directory,
-        using timestamp alignment to map reference (cautery) frame indices
+        using timestamp alignment to map reference (source) frame indices
         to source (filtered) frame indices.
 
         Since the filtered data is already multi-camera synced by
@@ -918,7 +950,7 @@ class ConversionWorker:
         t_start = time.time()
 
         # ------------------------------------------------------------------
-        # 1. Timestamp alignment: reference indices → source indices
+        # 1. Timestamp alignment: reference indices -> source indices
         # ------------------------------------------------------------------
         ref_left_dir = ref_session_dir / LEFT_IMG_DIR
         ref_files = list_sorted_frames(ref_left_dir, "_left.jpg")
@@ -947,11 +979,11 @@ class ConversionWorker:
         if total_frames <= 0:
             raise ValueError(
                 f"Empty slice after alignment: ref {start_idx}-{end_idx} "
-                f"→ src {new_start}-{new_end}"
+                f"-> src {new_start}-{new_end}"
             )
 
         print(
-            f"  Aligned ref[{start_idx}:{end_idx}] → src[{new_start}:{new_end}] "
+            f"  Aligned ref[{start_idx}:{end_idx}] -> src[{new_start}:{new_end}] "
             f"({total_frames} frames)"
         )
         t_align = time.time()
@@ -962,22 +994,19 @@ class ConversionWorker:
         left_paths = [src_left_dir / f for f in src_files]
 
         right_files = list_sorted_frames(src_session_dir / RIGHT_IMG_DIR, "_right.jpg")
-        right_paths = (
-            [src_session_dir / RIGHT_IMG_DIR / f for f in right_files]
-            if right_files else None
-        )
+        if not right_files:
+            raise ValueError(f"Missing right camera frames in {src_session_dir}")
+        right_paths = [src_session_dir / RIGHT_IMG_DIR / f for f in right_files]
 
         psm1_files = list_sorted_frames(src_session_dir / ENDO_PSM1_DIR, "_psm1.jpg")
-        psm1_paths = (
-            [src_session_dir / ENDO_PSM1_DIR / f for f in psm1_files]
-            if psm1_files else None
-        )
+        if not psm1_files:
+            raise ValueError(f"Missing PSM1 camera frames in {src_session_dir}")
+        psm1_paths = [src_session_dir / ENDO_PSM1_DIR / f for f in psm1_files]
 
         psm2_files = list_sorted_frames(src_session_dir / ENDO_PSM2_DIR, "_psm2.jpg")
-        psm2_paths = (
-            [src_session_dir / ENDO_PSM2_DIR / f for f in psm2_files]
-            if psm2_files else None
-        )
+        if not psm2_files:
+            raise ValueError(f"Missing PSM2 camera frames in {src_session_dir}")
+        psm2_paths = [src_session_dir / ENDO_PSM2_DIR / f for f in psm2_files]
 
         # ------------------------------------------------------------------
         # 3. Load CSV & pre-compute state/action matrices (sliced)
@@ -1009,7 +1038,7 @@ class ConversionWorker:
 
         # ------------------------------------------------------------------
         # 4. Pre-place source JPEGs & build frames with dummy images
-        #    (Eliminates JPEG decode → re-encode → re-decode round-trip)
+        #    (Eliminates JPEG decode -> re-encode -> re-decode round-trip)
         # ------------------------------------------------------------------
         from lerobot.datasets.utils import DEFAULT_IMAGE_PATH
 
