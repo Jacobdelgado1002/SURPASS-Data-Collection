@@ -4,7 +4,7 @@
 # Requires Python 3.10+
 
 # GUI
-PyQt5
+# PyQt5
 
 # Data processing
 numpy
@@ -13,9 +13,8 @@ opencv-python
 Pillow
 matplotlib
 tyro
-lerobot
-huggingface-hub
-PIL
+lerobot==0.3.3
+huggingface-hub==0.34.4
 
 # Video encoding/decoding
 av
