@@ -261,18 +261,20 @@ def validate_episode(episode_path: Path) -> Tuple[bool, str]:
     """Validate episode structure. Returns (is_valid, error_message)"""
     errors = []
     
-    left_dir = episode_path / LEFT_IMG_DIR
-    if not left_dir.exists():
-        errors.append(f"Missing directory: {LEFT_IMG_DIR}")
-    elif not list(left_dir.glob("*.jpg")):
-        errors.append(f"No images in: {LEFT_IMG_DIR}")
+    # Check all required/expected camera directories
+    for cam_dir_name in [LEFT_IMG_DIR, RIGHT_IMG_DIR, ENDO_PSM1_DIR, ENDO_PSM2_DIR]:
+        cam_dir = episode_path / cam_dir_name
+        if not cam_dir.exists():
+            errors.append(f"Missing directory: {cam_dir_name}")
+        elif not list(cam_dir.glob("*.jpg")):
+            errors.append(f"No images in: {cam_dir_name}")
     
     csv_path = episode_path / CSV_FILE
     if not csv_path.exists():
         errors.append(f"Missing CSV: {CSV_FILE}")
     
     if errors:
-        return False, "\n".join(errors)
+        return False, "; ".join(errors)
     return True, "Valid"
 
 
@@ -508,7 +510,7 @@ class ConversionWorker:
         try:
             self._run_conversion()
         except Exception as e:
-            print(f"Error: {str(e)}\n{traceback.format_exc()}", file=sys.stderr)
+            print(f"[ERROR] {str(e)}\n{traceback.format_exc()}", file=sys.stderr)
             sys.exit(1)
 
     @staticmethod
@@ -533,6 +535,8 @@ class ConversionWorker:
 
         self._run_pipeline_conversion(LeRobotDataset, write_info)
 
+    # Image shape should alwyas be the same for all episodes. That is why there are default values.
+    # If you are getting errors about image shapes, it is likely because the default values are incorrect.
     def _get_image_shapes(self, episodes: List[Path]) -> Tuple[Tuple, Tuple]:
             """Get image shapes from the first valid episode"""
             for episode_path in episodes:
@@ -851,6 +855,12 @@ class ConversionWorker:
 
             print(f"\n[{i+1}/{len(planned)}] Episode: {dst.parent.name}/{dst.name}")
 
+            # --- Validation Step ---
+            is_valid, err_msg = validate_episode(src)
+            if not is_valid:
+                print(f"    SKIPPING: {err_msg}", file=sys.stderr)
+                continue
+
             try:
                 t_ep_start = time.time()
                 self._process_planned_episode(dataset, ref, src, start, end, subtask_text)
@@ -870,7 +880,7 @@ class ConversionWorker:
                 else:
                     perfect_count += 1
                 print(
-                    f"✓ {dst.parent.name}/{dst.name} saved — "
+                    f"[SUCCESS] {dst.parent.name}/{dst.name} saved — "
                     f"processing: {t_proc_elapsed:.1f}s, encoding: {t_enc_elapsed:.1f}s, "
                     f"total: {t_ep_total:.1f}s  [task: \"{subtask_text}\"]"
                 )

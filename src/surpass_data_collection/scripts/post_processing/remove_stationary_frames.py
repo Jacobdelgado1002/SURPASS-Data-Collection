@@ -84,6 +84,15 @@ MOTION_COLUMNS: List[str] = [
     "psm2_js[4]",
     "psm2_js[5]",
     "psm2_jaw",
+    # Cartesian poses (for safer motion detection in SO(3) space)
+    "psm1_pose.orientation.x",
+    "psm1_pose.orientation.y",
+    "psm1_pose.orientation.z",
+    "psm1_pose.orientation.w",
+    "psm2_pose.orientation.x",
+    "psm2_pose.orientation.y",
+    "psm2_pose.orientation.z",
+    "psm2_pose.orientation.w",
 ]
 
 # Camera modality directories (must stay in sync with slice_affordance.py)
@@ -187,12 +196,30 @@ def compute_deltas(csv_path: Path) -> Tuple[Optional[np.ndarray], int]:
     if n_rows < 2:
         return None, n_rows
 
+    # --- Topological Fix: Quaternion Continuity ---
+    # Quaternions q and -q represent the SAME rotation. np.diff would see a
+    # massive jump (~2.0) if a sign flip occurs at a singularity. We enforce
+    # shortest-path continuity (flipping signs if dot product < 0) before diff.
+    quat_groups = [
+        ["psm1_pose.orientation.x", "psm1_pose.orientation.y", "psm1_pose.orientation.z", "psm1_pose.orientation.w"],
+        ["psm2_pose.orientation.x", "psm2_pose.orientation.y", "psm2_pose.orientation.z", "psm2_pose.orientation.w"]
+    ]
+    for q_group in quat_groups:
+        indices = [i for i, c in enumerate(cols_present) if c in q_group]
+        if len(indices) == 4:
+            # Vectorized sign-flip correction
+            q_arr = data[:, indices]  # n_rows, 4
+            for i in range(1, n_rows):
+                if np.dot(q_arr[i-1], q_arr[i]) < 0:
+                    q_arr[i] *= -1.0
+            data[:, indices] = q_arr
+
     # First-order difference  →  L2 norm per frame
     # np.diff + np.linalg.norm is already optimal for contiguous arrays.
     diffs = np.diff(data, axis=0)             # (n_rows-1, n_cols)
     # Einsum for squared L2 norm avoids a temporary allocation that
     # np.linalg.norm creates internally (it does sqrt(sum(x**2))).
-    # For 14 columns × thousands of rows, this is measurably faster.
+    # For 14+ columns × thousands of rows, this is measurably faster.
     deltas = np.sqrt(np.einsum("ij,ij->i", diffs, diffs))  # (n_rows-1,)
 
     return deltas, n_rows

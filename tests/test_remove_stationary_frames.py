@@ -233,3 +233,26 @@ class TestRemoveStationaryFrames:
         
         assert len(all_stats) == 1
         assert all_stats[0]["skipped"] is False
+
+    def test_compute_deltas_quaternion_continuity(self, tmp_path):
+        """Test that quaternion sign flips (hemisphere jumps) are neutralized before diff."""
+        csv_path = tmp_path / KINEMATIC_CSV_NAME
+        
+        # We simulate a stationary pose where the quaternion flips sign between every frame
+        # q and -q represent the same rotation. 
+        # Without the fix, diff would be ~2.0. With fix, diff should be 0.0.
+        df = pd.DataFrame({
+            "timestamp": [0, 1, 2, 3],
+            "psm1_pose.orientation.x": [0, 0, 0, 0],
+            "psm1_pose.orientation.y": [0, 0, 0, 0],
+            "psm1_pose.orientation.z": [0.707, -0.707, 0.707, -0.707],
+            "psm1_pose.orientation.w": [0.707, -0.707, 0.707, -0.707]
+        })
+        df.to_csv(csv_path, index=False)
+        
+        deltas, n_rows = compute_deltas(csv_path)
+        
+        assert n_rows == 4
+        # Every delta should be ~0.0 (strictly < threshold)
+        for d in deltas:
+            assert d < 1e-3, f"Quaternion flip was not neutralized: delta={d}"
