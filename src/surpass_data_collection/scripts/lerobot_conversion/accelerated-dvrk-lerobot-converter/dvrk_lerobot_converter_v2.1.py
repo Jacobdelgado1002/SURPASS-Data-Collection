@@ -486,11 +486,11 @@ def _patch_jpeg_image_saving(dataset):
 class ConversionWorker:
     """Worker class for running the conversion synchronously."""
     
-    def __init__(self, source_path: Path, output_dir: Path, dataset_name: str,
+    def __init__(self, source_data_path: Path, output_dir: Path, dataset_name: str,
                  psm1_tool: str, psm2_tool: str, fps: int,
                  annotations_dir: Optional[Path] = None,
                  trim_threshold: float = 1e-4):
-        self.source_path = source_path
+        self.source_data_path = source_data_path
         self.output_dir = output_dir
         self.dataset_name = dataset_name
         self.psm1_tool = psm1_tool
@@ -716,7 +716,7 @@ class ConversionWorker:
             f"(threshold={max_time_diff_ms:.1f}ms)..."
         )
         rc = run_filter_episodes(
-            source_dir=str(self.source_path),
+            source_dir=str(self.source_data_path),
             out_dir=str(filtered_dir),
             max_time_diff=max_time_diff_ms,
             min_images=10,
@@ -739,9 +739,9 @@ class ConversionWorker:
         n_stages = 4 if self.trim_threshold > 0 else 3
         print(f"Stage 2/{n_stages}: Planning affordance slices...")
         planned = plan_episodes(
-            self.annotations_dir,
-            self.source_path,             # raw data = cautery reference dir
-            Path("_unused"),              # out_dir placeholder (we don't copy)
+            source_data_path=self.source_data_path,
+            annotations_path=self.annotations_dir,
+            out_dir=Path("_unused"),
             source_dataset_dir=filtered_dir,
         )
         print(f"  Planned {len(planned)} episodes")
@@ -982,8 +982,8 @@ class ConversionWorker:
         # ------------------------------------------------------------------
         # 3. Load CSV & pre-compute state/action matrices (sliced)
         # ------------------------------------------------------------------
-        # CSV lives in the original raw data dir, not in the filtered cache
-        csv_path = ref_session_dir / CSV_FILE
+        # The CSV lives in the filtered cache, keeping a strict 1:1 mapping with src_files
+        csv_path = src_session_dir / CSV_FILE
         df = pd.read_csv(csv_path)
         state_cols  = [c for c in STATES_NAME  if c in df.columns]
         action_cols = [c for c in ACTIONS_NAME if c in df.columns]
@@ -1227,13 +1227,13 @@ def main():
         sys.exit(1)
 
     worker = ConversionWorker(
-        source_path=args.source_dir,
+        source_data_path=args.source_dir,
+        annotations_dir=args.annotations_dir,
         output_dir=args.output_dir,
         dataset_name=args.dataset_name,
         psm1_tool=args.psm1_tool,
         psm2_tool=args.psm2_tool,
         fps=args.fps,
-        annotations_dir=args.annotations_dir,
         trim_threshold=args.trim_threshold,
     )
 

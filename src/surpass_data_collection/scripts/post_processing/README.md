@@ -159,46 +159,42 @@ dataset_sliced/
 
 ### slice_affordance.py
 
-**Purpose**: Slice surgical robot session data into action-based episodes using JSON annotations.
+**Purpose**: Provide annotation parsing and episode planning utilities for downstream conversion pipelines.
 
 **Key Features**:
-- Timestamp-based alignment between reference and source datasets
-- Multi-modal data slicing (4 camera views + kinematic CSV)
-- Parallel processing for efficiency (episode-level and file-level)
-- Optional frame normalization after slicing
-- Hardlink support for fast copying
-- Binary search for frame alignment
+
+- Reads JSON annotations (e.g., `action_001.json`) containing `affordance_range`
+- Maps frame indices to sequential episode IDs based on action types
+- Validates source and reference directories
+- Provides programmatic API (`plan_episodes`) to yield matched `(start, end)` frame bounds
 
 **Use Cases**:
-- Extracting action segments from full surgical sessions
-- Slicing filtered datasets based on annotations
-- Creating action-specific training sets
-- Organizing data by surgical task type (grasp, dissect, etc.)
 
-**Command-Line Interface**:
+- Integrating action annotations into the `dvrk_lerobot_converter_v2.1` pipeline.
+- Sorting frames and extracting timestamp data natively.
 
-```bash
-# Basic slicing from raw cautery data
-python slice_affordance.py
+**Programmatic Usage**:
 
-# Slice from filtered dataset
-python slice_affordance.py --source_dataset_dir filtered_data \
-    --out_dir sliced_episodes
+```python
+from slice_affordance import plan_episodes
+from pathlib import Path
 
-# Dry run to preview planned episodes
-python slice_affordance.py --dry_run
+# Plan episodes from the annotation directory mapped to raw/filtered data
+planned = plan_episodes(
+    post_dir=Path("post_process"),
+    cautery_dir=Path("cautery"),
+    out_dir=Path("dataset_sliced"),
+    source_dataset_dir=Path("filtered_data")
+)
 
-# Use hardlinks for fast copying (same filesystem required)
-python slice_affordance.py --hardlink
-
-# Parallel processing with 8 episode workers, 16 copy workers
-python slice_affordance.py --episode-workers 8 --workers 16
-
-# Automatically reformat frame names after slicing
-python slice_affordance.py --reformat
+# Returns a list of tuples:
+# (annotation_path, ref_session_dir, src_session_dir, dst_base_dir, start_frame, end_frame)
+for item in planned:
+    ann, ref, src, dst, s, e = item
+    print(f"Planned range: {s}-{e} to {dst.name}")
 ```
 
-**Expected Data Structure**:
+**Expected Data Structure Overview**:
 
 *Annotation Data* (post_process):
 ```
@@ -221,66 +217,7 @@ post_process/
 }
 ```
 
-*Reference Dataset* (for timestamps):
-```
-cautery/
-└── cautery_tissue#1/
-    └── session_name/
-        ├── left_img_dir/
-        │   └── frame1756826516968031906_left.jpg
-        ├── right_img_dir/
-        ├── endo_psm1/
-        ├── endo_psm2/
-        └── ee_csv.csv
-```
-
-*Source Dataset* (to slice - may be filtered):
-```
-source_dataset/
-└── tissue_1/
-    └── session_name/
-        ├── left_img_dir/
-        ├── right_img_dir/
-        ├── endo_psm1/
-        ├── endo_psm2/
-        └── ee_csv.csv
-```
-
-**Output Structure**:
-```
-dataset_sliced/
-└── tissue_1/
-    ├── 1_grasp/              # Mapped from "grasp" action
-    │   ├── episode_001/
-    │   │   ├── left_img_dir/
-    │   │   ├── right_img_dir/
-    │   │   ├── endo_psm1/
-    │   │   ├── endo_psm2/
-    │   │   └── ee_csv.csv
-    │   └── episode_002/
-    └── 2_dissect/            # Mapped from "dissect" action
-        └── episode_001/
-```
-
-**Processing Pipeline**:
-
-1. **Discovery**: Find post-process annotation directories
-2. **Parsing**: Extract affordance_range (start/end frame indices) from JSON
-3. **Mapping**: Map frame indices to timestamps using reference dataset
-4. **Alignment**: Find corresponding frames in source via binary search
-5. **Copying**: Copy sliced data (images + CSV) to organized output
-6. **Normalization** (optional): Run reformat_data.py on output
-
-**Timestamp-Based Alignment**:
-
-The script ensures semantic consistency when slicing from filtered datasets:
-- Reference dataset provides ground truth timestamps
-- Source dataset may have different frame counts (due to filtering)
-- Binary search finds nearest matching timestamps
-- Alignment handles gaps and removed frames correctly
-
 **Action Mapping**:
-
 Actions are mapped to numbered subdirectories for consistent ordering:
 ```python
 ACTION_SUBDIRS = {
@@ -289,46 +226,7 @@ ACTION_SUBDIRS = {
 }
 ```
 
-**Options**:
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--post_process_dir` | Path | post_process | Annotation directory |
-| `--cautery_dir` | Path | cautery | Reference dataset (timestamps) |
-| `--source_dataset_dir` | Path | cautery_dir | Dataset to slice |
-| `--out_dir` | Path | dataset_sliced | Output directory |
-| `--episode-workers` | int | 4 | Parallel episodes to process |
-| `--workers` | int | 8 | File copy workers per episode |
-| `--hardlink` | flag | False | Use hardlinks instead of copying |
-| `--reformat` | flag | False | Run reformat_data.py after slicing |
-| `--dry_run` | flag | False | Preview planned episodes |
-
-**CSV Slicing**:
-- Preserves headers automatically
-- Uses 0-indexed row ranges
-- Handles missing timestamps gracefully
-- Clamps indices to valid ranges
-
-**Performance Optimization**:
-- Episode-level parallelism: Process multiple episodes simultaneously
-- File-level parallelism: Copy files within episode in parallel
-- Hardlink support: Instant "copying" on same filesystem
-- Binary search: O(log n) frame lookups
-- Streaming CSV: Memory-efficient row filtering
-
-**Common Use Cases**:
-
-```bash
-# Typical workflow: slice from filtered data
-python sync_image_kinematics/filter_episodes.py /raw /filtered
-python slice_affordance.py --source_dataset_dir filtered --hardlink
-
-# Slice and immediately reformat
-python slice_affordance.py --reformat
-
-# High-performance slicing
-python slice_affordance.py --episode-workers 12 --workers 24 --hardlink
-```
+*Note: This script was refactored to remove command-line orchestration and physical file-copying mechanics. It now operates strictly as an in-memory planning module.*
 
 ---
 
