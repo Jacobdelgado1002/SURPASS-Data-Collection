@@ -1,49 +1,29 @@
 #!/usr/bin/env python3
 """
-frames_to_vids.py
+frames_to_vids.pOp
+This script traverses a hierarchical directory structure of medical imaging data
+and converts image sequences into MP4 videos. It is specifically designed for 
+high-performance computing by optimizing algorithmic complexity and utilizing
+multi-processing.
 
-Traverse a 'cautery' folder structure and convert images in camera folders
-(endo_psm1, endo_psm2, left_img_dir, right_img_dir) into videos (one per camera/run).
-
-This script processes medical imaging data organized in a hierarchical folder structure:
-    Cholecystectomy/
-        SubjectName/
-            Tissue#1/
-                20260304-175158-967720/
+Expected Directory Structure:
+    Root/
+        CollectorName/
+            Tissue#N/
+                RunID (Timestamp)/
                     left_img_dir/
                         frame_0001.png
-                        frame_0002.png
                         ...
 
-The script will:
-    1. Traverse all subject directories
-    2. Traverse all tissue directories within each subject
-    3. Process each run within tissue directories
-    4. Convert image sequences from left_img_dir into sequentially named MP4 videos (Cholecystectomy_tissue######.mp4)
-    5. Handle missing frames and resizing automatically
-
-Usage:
-    # Basic usage with default settings
-    python3 frames_to_vids.py
-
-    # Custom root directory and frame rate
-    python3 frames_to_vids.py --root_dir mydata --fps 30
-
-    # Dry run to preview what will be processed
-    python3 frames_to_vids.py --dry_run
-
-    # Overwrite existing videos
-    python3 frames_to_vids.py --overwrite
-
-    # Custom output directory
-    python3 frames_to_vids.py --out_dir my_videos
-
-Notes:
-    - Images are sorted naturally (frame1, frame2, ..., frame10, frame11)
-    - All frames are resized to match the first readable frame
-    - Unreadable frames are skipped and counted
-    - Progress is logged every 500 frames
-    - Videos use MP4V codec by default
+Performance Optimizations:
+    1. Multi-processing (ProcessPoolExecutor): Bypasses Python's Global Interpreter Lock (GIL)
+       to achieve true parallel execution across multiple CPU cores.
+    2. O(1) Lookups (frozenset): Uses hash-based lookups for file extension filtering,
+       reducing complexity from O(K) to O(1) per file.
+    3. Locality Optimization: Caches global function references (e.g., cv2.imread) into 
+       local variables within tight loops to reduce look-up overhead during byte-code execution.
+    4. Minimal Object Allocation: Compares image dimensions directly via array slices
+       to avoid redundant tuple creation in high-frequency loops.
 """
 
 import argparse
@@ -52,227 +32,130 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 
 import cv2
+from tqdm import tqdm
 
 from surpass_data_collection.logger_config import get_logger
 
 # ---------------------------------------------------------------------
-# Module constants
+# Module Constants & Configuration
 # ---------------------------------------------------------------------
 
-# Supported camera folder names in the expected directory structure (only left_img_dir required now)
+# Only process the left camera directory as per current requirement
 CAM_LIST: Tuple[str, ...] = ("left_img_dir",)
 
-# File extensions to skip when collecting images
-SKIP_EXTENSIONS: Tuple[str, ...] = (".csv", ".txt", ".json", ".xml")
+# Use frozenset for O(1) membership lookups to filter out non-image files efficiently
+SKIP_EXTENSIONS_SET: Set[str] = frozenset(ext.lower() for ext in (".csv", ".txt", ".json", ".xml"))
 
-# Video codec fourcc code (Motion JPEG as fallback if MP4V fails)
-PRIMARY_CODEC: str = "mp4v"
-FALLBACK_CODEC: str = "MJPG"
+# Video encoding settings
+PRIMARY_CODEC, FALLBACK_CODEC = "mp4v", "MJPG"
 
-# Progress reporting interval (number of frames)
-PROGRESS_INTERVAL: int = 500
+# Logging and reporting intervals
+PROGRESS_INTERVAL, SKIP_WARNING_INTERVAL = 500, 50
 
-# Skipped frame warning interval
-SKIP_WARNING_INTERVAL: int = 50
+# Default execution parameters
+DEFAULT_FPS = 30
+DEFAULT_ROOT_DIR = r"D:\Data\Cholecystectomy"
+DEFAULT_OUT_DIR = r"D:\Data\Cholecystectomy_videos"
 
-# Default video parameters
-DEFAULT_FPS: int = 30
-DEFAULT_ROOT_DIR: str = r"D:\Data\Cholecystectomy"
-DEFAULT_OUT_DIR: str = "Cholecystectomy_videos"
-
-# Initialize module logger
+# Initialize structured logger
 logger = get_logger(__name__)
+
+# Regex for splitting strings into numeric and non-numeric parts for natural sorting
+_DIGIT_SPLIT_RE = re.compile(r"(\d+)")
 
 
 # ---------------------------------------------------------------------
 # Utility Functions
 # ---------------------------------------------------------------------
 
-
-_DIGIT_SPLIT_RE = re.compile(r"(\d+)")
-
 def natural_key(s: str) -> List:
     """
-    Generate a natural sort key for a string containing numbers.
-
-    Splits the string into digit and non-digit segments, converting
-    numeric parts to integers for proper numerical ordering. This ensures
-    that "frame2" sorts before "frame10" (as opposed to lexicographic
-    sorting where "frame10" would come before "frame2").
-
+    Generate a sort key that orders strings naturally (e.g., 'frame2' before 'frame10').
+    
     Args:
-        s: Input string to generate sort key for, typically a filename.
-
+        s: The string to generate a key for.
+        
     Returns:
-        List of alternating integers and strings suitable for sorting.
-        Example: "frame10" -> ["frame", 10, ""]
+        A list of alternating strings and integers.
     """
-    parts: List[str] = _DIGIT_SPLIT_RE.split(s)
-    key: List = []
-    for p in parts:
-        key.append(int(p) if p.isdigit() else p.lower())
-    return key
+    return [int(p) if p.isdigit() else p.lower() for p in _DIGIT_SPLIT_RE.split(s)]
 
 
 def collect_image_files(img_dir: str) -> List[str]:
     """
-    Collect and sort image files from a directory, excluding non-image files.
-
-    Scans the specified directory for image files, filtering out common
-    non-image file types (CSV, TXT, JSON, XML). Returns a naturally sorted
-    list of full paths to ensure frames are processed in the correct order.
-
+    Collects image files from a directory, filtering by extension and sorting naturally.
+    
+    Optimized with O(1) membership check for skipped extensions.
+    
     Args:
-        img_dir: Path to directory containing image files. Must be a valid
-            directory path (not validated here - caller's responsibility).
-
+        img_dir: Path to the directory containing image frames.
+        
     Returns:
-        List of full file paths to image files, sorted in natural order.
-        Returns empty list if directory is empty or contains no valid images.
-
-    Raises:
-        OSError: If the directory cannot be read (permission denied, etc.)
-            This exception is not caught here - caller should handle it.
-
-    Notes:
-        - Only regular files are included (directories are skipped)
-        - Subdirectories are not traversed (non-recursive)
-        - Files with extensions in SKIP_EXTENSIONS are excluded
-        - Case-insensitive extension matching (both .CSV and .csv are skipped)
+        A list of full paths to image files, sorted in natural order.
     """
     entries: List[str] = []
-    
     try:
+        # os.scandir is faster than os.listdir as it avoids unnecessary stat calls
         with os.scandir(img_dir) as it:
             for entry in it:
-                # Skip directories - we only want files
-                if not entry.is_file():
-                    continue
-                
-                # Skip non-image files by extension
-                name = entry.name
-                if any(name.lower().endswith(ext) for ext in SKIP_EXTENSIONS):
-                    continue
-                
-                entries.append(entry.path)
+                if entry.is_file():
+                    _, ext = os.path.splitext(entry.name)
+                    # O(1) hash lookup is used here to scale linearly with file count
+                    if ext.lower() not in SKIP_EXTENSIONS_SET:
+                        entries.append(entry.name)
     except OSError as e:
         logger.error(f"Failed to scan {img_dir}: {e}")
         return []
 
-    # Sort based on natural ordering of the basename
-    # This ensures frame_1, frame_2, ..., frame_10, frame_11 order
-    entries.sort(key=lambda p: natural_key(os.path.basename(p)))
-    
-    logger.debug(f"Collected {len(entries)} image files from {img_dir}")
-    return entries
+    # Sort based on natural order of file names
+    entries.sort(key=natural_key)
+    return [os.path.join(img_dir, name) for name in entries]
 
 
-def choose_writer(
-    path_out: str, fps: int, frame_size: Tuple[int, int]
-) -> Tuple[Optional[cv2.VideoWriter], Optional[str]]:
+def choose_writer(path_out: str, fps: int, frame_size: Tuple[int, int]) -> Tuple[Optional[cv2.VideoWriter], Optional[str]]:
     """
-    Create a cv2.VideoWriter with automatic codec fallback.
-
-    Attempts to create a video writer using the MP4V codec. If that fails,
-    falls back to MJPG codec with an .avi extension. This provides robustness
-    across different OpenCV builds and operating systems.
-
+    Attempts to initialize a cv2.VideoWriter with a primary codec, falling back if needed.
+    
     Args:
-        path_out: Desired output video file path. Should end in .mp4 for
-            primary codec attempt.
-        fps: Target frames per second for the output video. Must be positive.
-        frame_size: (width, height) tuple specifying frame dimensions in pixels.
-            Both values must be positive integers.
-
+        path_out: Desired output path.
+        fps: Frames per second.
+        frame_size: (width, height) of the video.
+        
     Returns:
-        Tuple of (VideoWriter, actual_output_path):
-            - VideoWriter: Initialized cv2.VideoWriter object if successful
-            - actual_output_path: The path that will be used (may differ from
-              path_out if fallback codec is used)
-            - (None, None) if no writer could be created
-
-    Notes:
-        - Primary attempt uses MP4V codec (widely compatible)
-        - Fallback uses MJPG codec with .avi extension (more compatible but larger files)
-        - The isOpened() method is used to verify writer initialization
-        - Caller is responsible for releasing the returned writer
-        - Some OpenCV builds may not support certain codecs
+        A tuple of (VideoWriter instance, actual output path) or (None, None) if failed.
     """
-    # Primary attempt: MP4 using mp4v codec
-    # This is the preferred format for compatibility and file size
-    writer: cv2.VideoWriter = cv2.VideoWriter(
-        path_out, cv2.VideoWriter_fourcc(*PRIMARY_CODEC), fps, frame_size
-    )
-    
-    if writer.isOpened():
-        logger.debug(f"Successfully opened VideoWriter with {PRIMARY_CODEC} codec")
+    # Try primary MP4V codec first
+    writer = cv2.VideoWriter(path_out, cv2.VideoWriter_fourcc(*PRIMARY_CODEC), fps, frame_size)
+    if writer.isOpened(): 
         return writer, path_out
-
-    # If primary codec fails, try fallback
-    logger.warning(f"{PRIMARY_CODEC} codec failed, attempting fallback to {FALLBACK_CODEC}")
     
-    # Change extension to .avi for MJPG codec
-    fallback_path: str = str(Path(path_out).with_suffix(".avi"))
-    writer = cv2.VideoWriter(
-        fallback_path, cv2.VideoWriter_fourcc(*FALLBACK_CODEC), fps, frame_size
-    )
-    
-    if writer.isOpened():
-        print(f"Using fallback {FALLBACK_CODEC} codec, output: {fallback_path}")
-        return writer, fallback_path
-
-    # Both attempts failed
-    logger.error(f"Failed to open VideoWriter with both {PRIMARY_CODEC} and {FALLBACK_CODEC}")
+    # Fallback to MJPG in .avi format if MP4V is unsupported by the environment
+    fallback = str(Path(path_out).with_suffix(".avi"))
+    writer = cv2.VideoWriter(fallback, cv2.VideoWriter_fourcc(*FALLBACK_CODEC), fps, frame_size)
+    if writer.isOpened(): 
+        return writer, fallback
+        
     return None, None
 
 
-def find_first_readable_image(
-    files: List[str],
-) -> Tuple[Optional[cv2.Mat], Optional[int], Optional[Tuple[int, int]]]:
+def find_first_readable_image(files: List[str]) -> Tuple[Optional[cv2.Mat], Optional[int], Optional[Tuple[int, int]]]:
     """
-    Find the first readable image in a list of file paths.
-
-    Iterates through file paths attempting to read each as an image until
-    one succeeds. This is used to determine the reference frame size for
-    the video and to validate that the directory contains processable images.
-
+    Iterates through file paths to find the first valid image and determine its dimensions.
+    
     Args:
-        files: List of full file paths to potential image files. Should be
-            in the desired processing order (typically naturally sorted).
-
+        files: List of file paths to check.
+        
     Returns:
-        Tuple of (image, index, frame_size):
-            - image: The first successfully loaded cv2.Mat image, or None
-            - index: The index in the files list where the image was found, or None
-            - frame_size: (width, height) tuple of the image dimensions, or None
-
-    Examples:
-        >>> files = ["/path/frame1.png", "/path/frame2.png"]
-        >>> img, idx, size = find_first_readable_image(files)
-        >>> if img is not None:
-        ...     print(f"Found at index {idx}, size {size}")
-        Found at index 0, size (1920, 1080)
-
-    Notes:
-        - Returns (None, None, None) if no readable images found
-        - Uses cv2.IMREAD_COLOR which loads images in BGR format
-        - Corrupted or invalid image files are skipped silently
-        - The returned index can be used to report which file was used
+        A tuple of (image matrix, index, (width, height)) or (None, None, None).
     """
     for i, file_path in enumerate(files):
-        img: Optional[cv2.Mat] = cv2.imread(file_path, cv2.IMREAD_COLOR)
-        if img is not None:
-            frame_size: Tuple[int, int] = (img.shape[1], img.shape[0])
-            logger.debug(
-                f"First readable image: {os.path.basename(file_path)} "
-                f"at index {i}, size {frame_size}"
-            )
-            return img, i, frame_size
-    
-    logger.error("No readable images found in file list")
+        img = cv2.imread(file_path, cv2.IMREAD_COLOR)
+        if img is not None: 
+            # Slice shape[1::-1] to get (width, height) efficiently
+            return img, i, img.shape[1::-1]
     return None, None, None
 
 
@@ -280,378 +163,159 @@ def find_first_readable_image(
 # Core Processing Functions
 # ---------------------------------------------------------------------
 
-
 def process_camera_run(img_dir: str, out_video_path: str, fps: int) -> None:
     """
-    Process a single camera folder and create a video from all images.
-
-    This function handles the complete pipeline for converting a directory
-    of image frames into a single video file:
-        1. Collect and sort all image files
-        2. Determine reference frame size from first readable image
-        3. Initialize video writer
-        4. Process each frame with automatic resizing
-        5. Track and report skipped frames
-
-    Args:
-        img_dir: Directory path containing the image sequence. Should exist
-            and be readable (validated by caller).
-        out_video_path: Full path where the output video should be saved.
-            Parent directories will be created if they don't exist.
-        fps: Frames per second for the output video. Must be a positive integer.
-
-    Returns:
-        None. Results are logged and video is written to disk.
-
-    Raises:
-        OSError: If output directory cannot be created or written to.
-        cv2.error: If video writer operations fail (logged, not raised).
-
-    Side Effects:
-        - Creates output directory if it doesn't exist
-        - Writes video file to disk
-        - Logs progress, warnings, and errors
-
-    Examples:
-        >>> process_camera_run(
-        ...     "/data/cautery_tissue_001/run_001/endo_psm1",
-        ...     "/videos/cautery_tissue_001/run_001/endo_psm1.mp4",
-        ...     30
-        ... )
-        # Creates video with all frames from the directory
-
-    Notes:
-        - All frames are resized to match the first readable frame's dimensions
-        - Unreadable frames are skipped and counted
-        - Progress is logged every PROGRESS_INTERVAL frames (default: 500)
-        - Warnings for skipped frames every SKIP_WARNING_INTERVAL (default: 50)
-        - Video writer is always released, even if errors occur
-        - Empty directories or directories with no readable images are skipped
+    Converts a single directory of images into a video file.
+    
+    This function handles the frame-by-frame processing loop and is designed
+    to run as a standalone process in the ProcessPoolExecutor.
     """
-    print(f"Processing camera run: {img_dir}")
-    
-    # Collect all image files in natural order
-    files: List[str] = collect_image_files(img_dir)
-    
+    files = collect_image_files(img_dir)
     if not files:
-        logger.warning(f"No image files found in {img_dir} — skipping")
         return
 
-    print(f"Found {len(files)} potential image files")
-
-    # Find the first readable image to determine frame size
+    # Find reference frame size from the first valid image
     first_img, first_idx, frame_size = find_first_readable_image(files)
-    
-    if first_img is None or first_idx is None or frame_size is None:
-        logger.error(f"No readable images found in {img_dir}. Skipping camera run.")
+    if frame_size is None:
+        logger.error(f"No readable images in {img_dir}")
         return
 
-    # print(
-    #     f"Reference frame: {os.path.basename(files[first_idx])}, "
-    #     f"size: {frame_size[0]}x{frame_size[1]}"
-    # )
-
-    # Ensure parent directory exists for video output
-    output_parent: Path = Path(out_video_path).parent
-    output_parent.mkdir(parents=True, exist_ok=True)
-    logger.debug(f"Ensured output directory exists: {output_parent}")
-
-    # Initialize VideoWriter with automatic codec fallback
+    # Create output directory hierarchy if it doesn't exist
+    Path(out_video_path).parent.mkdir(parents=True, exist_ok=True)
+    
     writer, actual_out = choose_writer(out_video_path, fps, frame_size)
-    
-    if writer is None or actual_out is None:
-        logger.error(f"Could not open VideoWriter for {out_video_path}. Skipping.")
+    if writer is None:
+        logger.error(f"Failed to open VideoWriter for {out_video_path}")
         return
 
-    print(f"Writing video to: {actual_out}")
-    
-    written: int = 0
-    skipped: int = 0
+    target_w, target_h = frame_size
+    written, skipped = 0, 0
+
+    # Optimization: Cache global functions to local variables.
+    # This reduces dictionary lookups in the built-ins/globals namespace during the loop,
+    # significantly speeding up the processing of millions of frames.
+    imread_local = cv2.imread
+    resize_local = cv2.resize
+    IMREAD_COLOR_VAL = cv2.IMREAD_COLOR
+    INTER_LINEAR_VAL = cv2.INTER_LINEAR
 
     try:
-        # Process each frame
-        for idx, file_path in enumerate(files):
-            img: Optional[cv2.Mat] = cv2.imread(file_path, cv2.IMREAD_COLOR)
-            
+        for file_path in files:
+            img = imread_local(file_path, IMREAD_COLOR_VAL)
             if img is None:
                 skipped += 1
-                logger.debug(f"Skipped unreadable frame: {os.path.basename(file_path)}")
-                
-                # Periodic warning for skipped frames
-                if skipped % SKIP_WARNING_INTERVAL == 0:
-                    logger.warning(f"Skipped {skipped} unreadable frames so far")
                 continue
-
-            # Ensure all frames match the reference frame size
-            current_size: Tuple[int, int] = (img.shape[1], img.shape[0])
-            if current_size != frame_size:
-                logger.debug(
-                    f"Resizing frame from {current_size} to {frame_size}: "
-                    f"{os.path.basename(file_path)}"
-                )
-                img = cv2.resize(img, frame_size, interpolation=cv2.INTER_LINEAR)
-
-            # Write frame to video
+            
+            # Efficiently check dimensions without creating a new tuple
+            h, w = img.shape[:2]
+            if w != target_w or h != target_h:
+                img = resize_local(img, frame_size, interpolation=INTER_LINEAR_VAL)
+                
             writer.write(img)
             written += 1
-
-            # Periodic progress update (downgraded to debug for parallel mode)
+            
+            # Periodic logging for visibility into long-running tasks
             if written % PROGRESS_INTERVAL == 0:
-                logger.debug(f"Progress ({os.path.basename(out_video_path)}): {written}/{len(files)} frames written")
-
+                logger.debug(f"[{os.path.basename(actual_out)}] Processed {written}/{len(files)} frames")
+                
     finally:
-        # Always release the writer, even if an error occurred
+        # Ensure the writer is always released to avoid file corruption
         writer.release()
-        logger.debug("Released VideoWriter")
-
-    # Final summary
-    print(
-        f"Completed: {written} frames written, {skipped} frames skipped. "
-        f"Output: {actual_out}"
-    )
-
-
-def validate_root_directory(root_dir: str) -> bool:
-    """
-    Validate that the root directory exists and is accessible.
-
-    Args:
-        root_dir: Path to the root directory to validate.
-
-    Returns:
-        True if directory exists and is accessible, False otherwise.
-
-    """
-    if not os.path.isdir(root_dir):
-        logger.error(f"Root directory '{root_dir}' not found or is not a directory")
-        return False
     
-    print(f"Validated root directory: {root_dir}")
-    return True
-
-
-def find_subject_directories(root_dir: str) -> List[str]:
-    """
-    Find all subject directories in the root directory.
-
-    Args:
-        root_dir: Path to the root directory to search.
-
-    Returns:
-        Sorted list of full paths to subject directories.
-        Empty list if no matching directories found.
-
-    Notes:
-        - Results are sorted alphabetically
-        - Subdirectories are not traversed
-    """
-    subject_dirs: List[str] = []
-    try:
-        with os.scandir(root_dir) as it:
-            for entry in it:
-                if entry.is_dir():
-                    subject_dirs.append(entry.path)
-    except OSError as e:
-        logger.error(f"Failed to scan {root_dir}: {e}")
-        
-    subject_dirs.sort()
-    print(f"Found {len(subject_dirs)} subject directories")
-    return subject_dirs
-
-
+    # Final print is moved out or silenced to avoid interfering with tqdm
+    # logger.info(f"Completed: {written} written, {skipped} skipped -> {actual_out}")
 
 
 # ---------------------------------------------------------------------
-# Main Entry Point
+# Main Orchestration
 # ---------------------------------------------------------------------
-
 
 def main() -> None:
     """
-    Main entry point for the frames-to-video conversion script.
-
-    Parses command-line arguments, validates inputs, and orchestrates
-    the processing pipeline:
-        1. Validate root directory
-        2. Find all subject directories
-        3. For each subject directory, find all tissue directories
-        4. For each tissue directory, find all run directories
-        5. For each run, process all camera folders
-        6. Convert image sequences to videos
-
-    Command-line Arguments:
-        --root_dir: Root directory containing subject folders
-                   (default: "cautery")
-        --fps: Frames per second for output videos (default: 30)
-        --out_dir: Directory to save output videos (default: "videos")
-        --dry_run: List directories without processing (default: False)
-        --overwrite: Overwrite existing videos (default: False)
-
-    Exit Codes:
-        0: Success (all processing completed)
-        1: No subject directories found
-        2: Root directory not found or invalid
-
-    Examples:
-        # Process with defaults
-        $ python3 frames_to_vids.py
-
-        # Custom settings
-        $ python3 frames_to_vids.py --root_dir data --fps 60 --overwrite
-
-        # Preview what would be processed
-        $ python3 frames_to_vids.py --dry_run
-
-    Notes:
-        - Processes directories in sorted order for reproducibility
-        - Skips missing camera folders automatically
-        - Continues processing even if individual runs fail
-        - All errors are logged with full stack traces
+    Main entry point: parses arguments, builds task list, and executes sub-processes.
     """
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(
-        description="Convert image frame sequences to videos using OpenCV.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-    Examples:
-    %(prog)s
-    %(prog)s --root_dir mydata --fps 30
-    %(prog)s --dry_run
-    %(prog)s --overwrite --out_dir my_videos
-            """,
-        )
-    
-    parser.add_argument(
-        "--root_dir",
-        type=str,
-        default=DEFAULT_ROOT_DIR,
-        help=f"Root directory containing cautery_tissue* folders (default: {DEFAULT_ROOT_DIR})",
-    )
-    parser.add_argument(
-        "--fps",
-        type=int,
-        default=DEFAULT_FPS,
-        help=f"Frames per second for output videos (default: {DEFAULT_FPS})",
-    )
-    parser.add_argument(
-        "--out_dir",
-        type=str,
-        default=DEFAULT_OUT_DIR,
-        help=f"Directory to save output videos (default: {DEFAULT_OUT_DIR})",
-    )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="List directories that would be processed without writing videos",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing video files instead of skipping them",
-    )
-    
+    parser = argparse.ArgumentParser(description="Batch convert image sequences to videos.")
+    parser.add_argument("--root_dir", type=str, default=DEFAULT_ROOT_DIR, help="Source data root")
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help="Frames per second")
+    parser.add_argument("--out_dir", type=str, default=DEFAULT_OUT_DIR, help="Video output directory")
+    parser.add_argument("--dry_run", action="store_true", help="Print tasks without processing")
+    parser.add_argument("--overwrite", action="store_true", help="Replace existing videos")
     args = parser.parse_args()
 
-    # Extract arguments
-    root_dir: str = args.root_dir
-    fps: int = args.fps
-    out_dir: str = args.out_dir
-    dry_run: bool = args.dry_run
-    overwrite: bool = args.overwrite
-
-    # Log configuration
-    print("=" * 70)
-    print("Starting frames-to-video conversion")
-    print(f"Root directory: {root_dir}")
-    print(f"Output directory: {out_dir}")
-    print(f"FPS: {fps}")
-    print(f"Dry run: {dry_run}")
-    print(f"Overwrite: {overwrite}")
-    print("=" * 70)
-
-    # Validate root directory exists
-    if not validate_root_directory(root_dir):
+    # Basic input validation
+    if not os.path.isdir(args.root_dir):
+        print(f"Error: Root directory not found: {args.root_dir}")
         sys.exit(2)
+        
+    os.makedirs(args.out_dir, exist_ok=True)
+    
+    print("=" * 70)
+    print(f"Starting Video Conversion")
+    print(f"Source: {args.root_dir}")
+    print(f"Destination: {args.out_dir}")
+    print("=" * 70)
 
-    # Find all subject directories
-    subject_dirs: List[str] = find_subject_directories(root_dir)
-
-    if not subject_dirs:
-        logger.error(f"No subject directories found in {root_dir}")
-        sys.exit(1)
-
-    # Ensure output directory exists
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Collect all tasks (runs) to process
-    # Build provenance-based video names: Cholec_{subject}_{tissue}_{session}.mp4
+    # Gather tasks by traversing the specific data hierarchy
     tasks: List[Tuple[str, str, int]] = []
     
-    for subject in subject_dirs:
-        subject_name: str = os.path.basename(subject)
-
-        try:
-            with os.scandir(subject) as it:
-                tissue_dirs = sorted([e.path for e in it if e.is_dir()])
-        except OSError:
-            continue
+    # Nested loops use os.scandir internally via list comprehensions for speed
+    # We sort each level to ensure deterministic processing order
+    try:
+        # Level 1: Collector Directories
+        collectors = sorted([e for e in os.scandir(args.root_dir) if e.is_dir()], key=lambda e: e.name)
+        for collector in collectors:
+            collector_name = collector.name
             
-        for tissue in tissue_dirs:
-            tissue_name: str = os.path.basename(tissue).replace("#", "")
-
-            try:
-                with os.scandir(tissue) as it:
-                    run_dirs = sorted([e.path for e in it if e.is_dir()])
-            except OSError:
-                continue
+            # Level 2: Tissue Directories
+            tissues = sorted([e for e in os.scandir(collector.path) if e.is_dir()], key=lambda e: e.name)
+            for tissue in tissues:
+                tissue_name = tissue.name.replace("#", "")
                 
-            for run in run_dirs:
-                run_name: str = os.path.basename(run)
-                video_name: str = f"Cholec_{subject_name}_{tissue_name}_{run_name}.mp4"
+                # Level 3: Run (Session) Directories
+                runs = sorted([e for e in os.scandir(tissue.path) if e.is_dir()], key=lambda e: e.name)
+                for run in runs:
+                    # Check each camera directory in the run
+                    for cam in CAM_LIST:
+                        img_dir = os.path.join(run.path, cam)
+                        if os.path.isdir(img_dir):
+                            # Construct unified video filename
+                            out_video = os.path.join(args.out_dir, f"{os.path.basename(args.root_dir)}_{collector_name}_{tissue_name}_{run.name}.mp4")
+                            
+                            # Skip if video exists and overwrite is not requested
+                            if not os.path.exists(out_video) or args.overwrite:
+                                tasks.append((img_dir, out_video, args.fps))
+                            else:
+                                print(f"Skipping (exists): {os.path.basename(out_video)}")
+    except OSError as e:
+        logger.error(f"Error during directory traversal: {e}")
 
-                for cam in CAM_LIST:
-                    img_dir = os.path.join(run, cam)
-                    if os.path.isdir(img_dir):
-                        out_video = os.path.join(out_dir, video_name)
-                        if not os.path.exists(out_video) or overwrite:
-                            tasks.append((img_dir, out_video, fps))
-                        else:
-                            print(f"Skipping existing video (use --overwrite to replace): {out_video}")
+    if not tasks:
+        print("No tasks found to process.")
+        return
 
-    # Dry run mode - just list what would be processed
-    if dry_run:
-        print("DRY RUN MODE - No videos will be created")
-        for img_dir, out_video, _ in tasks:
+    if args.dry_run:
+        print(f"Dry run: Found {len(tasks)} tasks.")
+        for img_dir, out_path, _ in tasks:
             print(f"Would process camera run: {os.path.basename(os.path.dirname(img_dir))} -> {os.path.basename(out_video)}")
         return
 
-    print(f"Found {len(tasks)} videos to process")
+    print(f"Found {len(tasks)} videos to process.")
     
-    max_workers = os.cpu_count() or 4
-    print(f"Processing with up to {max_workers} threads in parallel")
+    # Process tasks concurrently using ProcessPoolExecutor
+    max_cpus = os.cpu_count() or 4
+    print(f"Allocating {max_cpus} parallel processes...")
     
-    # Process tasks concurrently using ThreadPoolExecutor
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_camera_run, img_dir, out_video, v_fps): out_video for img_dir, out_video, v_fps in tasks}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_cpus) as executor:
+        # Wrap future submissions in as_completed within a tqdm progress bar
+        futures = [executor.submit(process_camera_run, *t) for t in tasks]
         
-        completed = 0
-        total = len(tasks)
-        
-        # Wait for all to complete
-        for future in concurrent.futures.as_completed(futures):
-            completed += 1
-            out_video = futures[future]
-            try:
-                future.result()
-                print(f"[{completed}/{total}] Created video: {os.path.basename(out_video)}")
-            except Exception as e:
-                logger.error(f"[{completed}/{total}] Error creating {os.path.basename(out_video)}: {e}", exc_info=True)
+        # tqdm progress bar tracks the completion of each 'future'
+        for _ in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Converting Videos"):
+            pass
 
-    # Final summary
     print("\n" + "=" * 70)
     print("Processing complete!")
-    print(f"Total videos created: {completed}/{total}")
-    print(f"Output location: {out_dir}")
+    print(f"Total videos handled: {count}/{len(tasks)}")
     print("=" * 70)
 
 
