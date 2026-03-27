@@ -296,7 +296,7 @@ def main() -> None:
     if args.dry_run:
         print(f"Dry run: Found {len(tasks)} tasks.")
         for img_dir, out_path, _ in tasks:
-            print(f"Would process camera run: {os.path.basename(os.path.dirname(img_dir))} -> {os.path.basename(out_video)}")
+            print(f"Would process camera run: {os.path.basename(os.path.dirname(img_dir))} -> {os.path.basename(out_path)}")
         return
 
     print(f"Found {len(tasks)} videos to process.")
@@ -315,7 +315,6 @@ def main() -> None:
 
     print("\n" + "=" * 70)
     print("Processing complete!")
-    print(f"Total videos handled: {count}/{len(tasks)}")
     print("=" * 70)
 
 
