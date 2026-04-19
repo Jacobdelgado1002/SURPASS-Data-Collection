@@ -2,56 +2,72 @@
 """
 reformat_data.py — Full pipeline for restructuring surgical robot datasets.
 
-Implements the complete workflow from ``dvrk_lerobot_converter_v2.1.py``
-(filter → plan/slice → trim → restructure) but outputs to a canonical
-directory structure instead of converting to LeRobot format.
+Supports two operating modes:
 
-Pipeline Stages:
+**Annotation Mode** (``--annotations-dir`` provided):
+    Legacy workflow from ``dvrk_lerobot_converter_v2.1.py``
+    (filter → plan/slice → trim → restructure).  Requires JSON annotations
+    with ``affordance_range`` to slice long recording sessions.
+
+**Direct Mode** (``--annotations-dir`` omitted):
+    For the new folder structure where each action is collected as an
+    individual recording (created by ``create_cautery_folder_structure.py``).
+    Each action folder already IS a single episode — no annotation slicing
+    is needed.  The pipeline becomes: filter → discover → trim → restructure.
+
+    Expected input structure (``--input`` at dataset level)::
+
+        Cholecystectomy/
+          Tissue#1/
+            Jacob/                              ← collector
+              unzipping/                        ← phase
+                1_grabbing_gallbladder_right/   ← action (= 1 episode)
+                  left_img_dir/ right_img_dir/ endo_psm1/ endo_psm2/ ee_csv.csv
+          Tissue#2/
+            ...
+
+Pipeline Stages (Annotation Mode):
     1. **Filter & Synchronise** — ``run_filter_episodes()``
-       Strict multi-camera sync removes misaligned frames and copies
-       hardlinked data to an intermediate ``_filtered_cache/``.
-
     2. **Plan Affordance Slices** — ``plan_episodes()``
-       Reads annotation JSONs, maps ``affordance_range`` to frame indices,
-       and produces ``(ann, ref, src, dst, start, end)`` tuples.
-
     3. **Trim Stationary Frames** (optional)
-       Adjusts start/end indices to remove stationary head/tail based on
-       kinematics deltas.
+    4. **Restructure** — copy with normalised names/timestamps
 
-    4. **Restructure**
-       Copies sliced data into the canonical format:
-           output/dataset_name/tissue_N/action_subdir/episode_NNN/
-               left_img_dir/   frame000000_left.jpg
-               right_img_dir/  frame000000_right.jpg
-               endo_psm1/      frame000000_psm1.jpg
-               endo_psm2/      frame000000_psm2.jpg
-               ee_csv.csv      (timestamps normalised to relative seconds)
+Pipeline Stages (Direct Mode):
+    1. **Filter & Synchronise** — ``run_filter_episodes()``
+    2. **Discover Episodes** — recursively find action directories
+    3. **Trim Stationary Frames** (optional)
+    4. **Restructure** — copy with normalised names/timestamps
 
 Data Integrity:
     - Original data is NEVER modified.  Output is always a fresh copy.
     - Hardlinks are optional (``--use-hardlink``) for speed when source and
       destination reside on the same filesystem.
 
-Example CLI:
+Example CLI (Annotation Mode):
     python reformat_data.py \\
         --input  Cholecystectomy/tissues \\
         --annotations-dir Cholecystectomy/annotations \\
         --output restructured_output
 
+Example CLI (Direct Mode — no annotations):
     python reformat_data.py \\
-        --input  Cholecystectomy/tissues \\
-        --annotations-dir Cholecystectomy/annotations \\
-        --output restructured_output \\
-        --dataset-name Cholecystectomy \\
-        --fps 30 --workers 8 --use-hardlink
+        --input  Cholecystectomy \\
+        --output restructured_output
 
 Programmatic usage:
     from reformat_data import run_pipeline, PipelineConfig
 
+    # Annotation mode
     cfg = PipelineConfig(
         source_dir=Path("Cholecystectomy/tissues"),
         annotations_dir=Path("Cholecystectomy/annotations"),
+        output_dir=Path("restructured_output"),
+    )
+    report = run_pipeline(cfg)
+
+    # Direct mode (no annotations_dir)
+    cfg = PipelineConfig(
+        source_dir=Path("Cholecystectomy"),
         output_dir=Path("restructured_output"),
     )
     report = run_pipeline(cfg)
@@ -63,6 +79,7 @@ import argparse
 import csv
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -153,8 +170,8 @@ class PipelineConfig:
     """All configuration for the restructuring pipeline."""
 
     source_dir: Path
-    annotations_dir: Path
     output_dir: Path
+    annotations_dir: Optional[Path] = None
     dataset_name: str = "Cholecystectomy"
     fps: int = 30
     workers: int = 4
@@ -196,6 +213,22 @@ class PipelineReport:
     trim_stats: Dict[str, int] = field(default_factory=dict)
     episode_results: List[EpisodeResult] = field(default_factory=list)
     elapsed_s: float = 0.0
+
+
+@dataclass
+class DirectEpisodeInfo:
+    """Metadata for a single episode discovered in the direct structure.
+
+    In the direct structure each action folder is a self-contained episode.
+    Path hierarchy: ``Tissue#N / collector / phase / action``.
+    """
+
+    source_dir: Path
+    tissue_label: str  # e.g. "Tissue#1"
+    tissue_num: int  # e.g. 1
+    collector: str  # e.g. "Jacob"
+    phase: str  # e.g. "unzipping"
+    action: str  # e.g. "1_grabbing_gallbladder_right"
 
 
 # =============================================================================
@@ -531,8 +564,6 @@ def _extract_tissue_num_from_dst(dst: Path) -> int:
 
     ``dst.parent.parent.name`` is e.g. ``"Jacob_tissue1"`` or ``"tissue_1"``.
     """
-    import re
-
     tissue_label = dst.parent.parent.name
     # Match patterns like "Jacob_tissue1", "tissue_1", "tissue1"
     match = re.search(r"tissue_?(\d+)", tissue_label, re.IGNORECASE)
@@ -853,6 +884,495 @@ def stage_restructure(
 
 
 # =============================================================================
+# DIRECT MODE: DISCOVER → TRIM → RESTRUCTURE
+# =============================================================================
+
+
+def _discover_direct_episodes(root_dir: Path) -> List[DirectEpisodeInfo]:
+    """Walk *root_dir* and discover all direct-mode episodes.
+
+    A valid episode is a directory containing ``ee_csv.csv`` and at least
+    one camera subdirectory (``left_img_dir``).
+
+    Path hierarchy expected::
+
+        root_dir / Tissue#N / collector / phase / action /
+            left_img_dir/ right_img_dir/ endo_psm1/ endo_psm2/ ee_csv.csv
+
+    Returns:
+        Sorted list of :class:`DirectEpisodeInfo`.
+    """
+    _TISSUE_RE = re.compile(r"Tissue#?(\d+)", re.IGNORECASE)
+
+    episodes: List[DirectEpisodeInfo] = []
+
+    for csv_file in root_dir.rglob(CSV_FILE):
+        episode_dir = csv_file.parent
+
+        # Must have at least the left camera directory
+        if not (episode_dir / LEFT_IMG_DIR).is_dir():
+            continue
+        # Must have at least one image
+        if not any((episode_dir / LEFT_IMG_DIR).glob("*.jpg")):
+            continue
+
+        # Parse path components relative to root
+        try:
+            rel = episode_dir.relative_to(root_dir)
+        except ValueError:
+            continue
+
+        parts = rel.parts
+
+        # Locate the Tissue#N component
+        tissue_idx = -1
+        tissue_label = ""
+        tissue_num = 0
+        for i, part in enumerate(parts):
+            m = _TISSUE_RE.match(part)
+            if m:
+                tissue_idx = i
+                tissue_label = part
+                tissue_num = int(m.group(1))
+                break
+
+        if tissue_idx < 0:
+            logger.debug(
+                "Skipping %s — no Tissue#N component found in path", episode_dir
+            )
+            continue
+
+        # Parts after Tissue#N: collector / phase / action
+        remaining = parts[tissue_idx + 1 :]
+
+        if len(remaining) >= 3:
+            collector = remaining[0]
+            phase = remaining[1]
+            action = remaining[2]
+        elif len(remaining) == 2:
+            collector = ""
+            phase = remaining[0]
+            action = remaining[1]
+        elif len(remaining) == 1:
+            collector = ""
+            phase = ""
+            action = remaining[0]
+        else:
+            collector = ""
+            phase = ""
+            action = episode_dir.name
+
+        episodes.append(
+            DirectEpisodeInfo(
+                source_dir=episode_dir,
+                tissue_label=tissue_label,
+                tissue_num=tissue_num,
+                collector=collector,
+                phase=phase,
+                action=action,
+            )
+        )
+
+    episodes.sort(key=lambda e: (e.tissue_num, e.collector, e.phase, e.action))
+    logger.info("Discovered %d direct episodes under %s", len(episodes), root_dir)
+    return episodes
+
+
+def stage_trim_direct(
+    episodes: List[DirectEpisodeInfo],
+    threshold: float,
+) -> Tuple[List[Tuple[DirectEpisodeInfo, int, int]], Dict[str, int]]:
+    """Compute stationary-frame trim ranges for each direct episode.
+
+    Returns:
+        (episodes_with_trims, stats_dict) where each element of the list
+        is ``(episode_info, trim_start, trim_end)``.
+    """
+    logger.info(
+        "Trimming stationary frames (threshold=%.1e) on %d episodes...",
+        threshold,
+        len(episodes),
+    )
+
+    results: List[Tuple[DirectEpisodeInfo, int, int]] = []
+    stats = {"total": len(episodes), "trimmed": 0, "frames_removed": 0}
+
+    for ep in episodes:
+        csv_path = ep.source_dir / CSV_FILE
+
+        # Determine total frame count from left camera
+        left_dir = ep.source_dir / LEFT_IMG_DIR
+        frame_files = list_sorted_frames(left_dir, CAMERA_SUFFIXES[LEFT_IMG_DIR])
+        n_frames = len(frame_files)
+
+        if n_frames < 10:
+            results.append((ep, 0, max(0, n_frames - 1)))
+            continue
+
+        try:
+            deltas, _ = compute_deltas(csv_path)
+            if deltas is None:
+                results.append((ep, 0, n_frames - 1))
+                continue
+        except Exception:
+            results.append((ep, 0, n_frames - 1))
+            continue
+
+        trim_start, trim_end = find_trim_range(deltas, n_frames, threshold)
+
+        if trim_end - trim_start + 1 < 10:
+            # Trimmed too short — keep original
+            results.append((ep, 0, n_frames - 1))
+            continue
+
+        if trim_start > 0 or trim_end < n_frames - 1:
+            removed = n_frames - (trim_end - trim_start + 1)
+            stats["trimmed"] += 1
+            stats["frames_removed"] += removed
+
+        results.append((ep, trim_start, trim_end))
+
+    logger.info(
+        "  Trimmed %d/%d episodes, removed %d total frames",
+        stats["trimmed"],
+        stats["total"],
+        stats["frames_removed"],
+    )
+    return results, stats
+
+
+def _process_direct_episode(
+    config: PipelineConfig,
+    episode_info: DirectEpisodeInfo,
+    trim_start: int,
+    trim_end: int,
+    output_episode_dir: Path,
+    episode_id: str,
+) -> EpisodeResult:
+    """Process a single direct-mode episode: validate, copy, normalise.
+
+    Unlike ``_process_single_episode`` (annotation mode), this does NOT
+    perform annotation-based timestamp alignment.  The episode directory
+    already contains exactly one self-contained recording.
+    """
+    result = EpisodeResult(
+        episode_id=episode_id,
+        tissue=episode_info.tissue_label,
+        action=episode_info.action,
+        output_path=str(output_episode_dir),
+        source_session=str(episode_info.source_dir),
+    )
+    t_start = time.time()
+
+    try:
+        # ------------------------------------------------------------------
+        # 1. Validate source episode
+        # ------------------------------------------------------------------
+        is_valid, err_msg = _validate_episode_source(episode_info.source_dir)
+        if not is_valid:
+            result.error = f"Validation failed: {err_msg}"
+            result.skipped = True
+            return result
+
+        # ------------------------------------------------------------------
+        # 2. Build frame lists for all cameras
+        # ------------------------------------------------------------------
+        camera_files: Dict[str, List[str]] = {}
+        for cam_dir, cam_suffix in CAMERA_SUFFIXES.items():
+            cam_files = list_sorted_frames(
+                episode_info.source_dir / cam_dir, cam_suffix
+            )
+            if not cam_files:
+                result.error = f"Missing {cam_dir} frames in {episode_info.source_dir}"
+                result.skipped = True
+                return result
+            camera_files[cam_dir] = cam_files
+
+        # ------------------------------------------------------------------
+        # 3. Clamp trim range to actual camera frame counts
+        # ------------------------------------------------------------------
+        min_cam_count = min(len(files) for files in camera_files.values())
+        actual_end = min(trim_end, min_cam_count - 1)
+        total_frames = actual_end - trim_start + 1
+
+        if total_frames <= 0:
+            result.error = "No frames after trimming/clamping"
+            result.skipped = True
+            return result
+
+        result.frame_range = (trim_start, actual_end)
+
+        # ------------------------------------------------------------------
+        # 4. Dry-run shortcut
+        # ------------------------------------------------------------------
+        if config.dry_run:
+            result.num_frames = total_frames
+            result.success = True
+            result.duration_s = time.time() - t_start
+            logger.info(
+                "  [DRY RUN] Would copy %d frames to %s",
+                total_frames,
+                output_episode_dir,
+            )
+            return result
+
+        # ------------------------------------------------------------------
+        # 5. Copy frames with normalised names
+        # ------------------------------------------------------------------
+        frames_copied = 0
+        for cam_dir, cam_suffix_name in CAMERA_MODALITIES.items():
+            cam_out_dir = output_episode_dir / cam_dir
+            cam_out_dir.mkdir(parents=True, exist_ok=True)
+            cam_files_list = camera_files[cam_dir]
+
+            for out_idx in range(total_frames):
+                src_idx = trim_start + out_idx
+                if src_idx >= len(cam_files_list):
+                    logger.warning(
+                        "  Frame index %d out of range for %s (%d files)",
+                        src_idx,
+                        cam_dir,
+                        len(cam_files_list),
+                    )
+                    continue
+
+                src_file = (
+                    episode_info.source_dir / cam_dir / cam_files_list[src_idx]
+                )
+                ext = src_file.suffix.lower()
+                dst_file = (
+                    cam_out_dir / f"frame{out_idx:06d}{cam_suffix_name}{ext}"
+                )
+
+                if not src_file.exists():
+                    logger.warning("  Source file missing: %s", src_file)
+                    continue
+
+                if _copy_or_hardlink(src_file, dst_file, config.use_hardlink):
+                    frames_copied += 1
+
+        result.num_frames = frames_copied // max(len(CAMERA_MODALITIES), 1)
+
+        # ------------------------------------------------------------------
+        # 6. Slice CSV and normalise timestamps
+        # ------------------------------------------------------------------
+        csv_src = episode_info.source_dir / CSV_FILE
+        csv_dst = output_episode_dir / CSV_FILE
+
+        try:
+            df = pd.read_csv(csv_src)
+        except Exception as exc:
+            result.error = f"Failed to read CSV {csv_src}: {exc}"
+            result.skipped = True
+            if output_episode_dir.exists():
+                shutil.rmtree(output_episode_dir)
+            return result
+
+        actual_csv_end = min(actual_end, len(df) - 1)
+        sliced_df = df.iloc[trim_start : actual_csv_end + 1].copy()
+        sliced_df.reset_index(drop=True, inplace=True)
+
+        # Normalise timestamps to relative seconds
+        dt = 1.0 / config.fps
+        timestamp_col = sliced_df.columns[0]
+        sliced_df[timestamp_col] = [
+            f"{i * dt:.4f}" for i in range(len(sliced_df))
+        ]
+
+        csv_dst.parent.mkdir(parents=True, exist_ok=True)
+        sliced_df.to_csv(csv_dst, index=False)
+        result.csv_rows = len(sliced_df)
+
+        # ------------------------------------------------------------------
+        # 7. Final validation
+        # ------------------------------------------------------------------
+        if result.num_frames != result.csv_rows:
+            logger.warning(
+                "  Frame/CSV mismatch: %d frames vs %d CSV rows in %s",
+                result.num_frames,
+                result.csv_rows,
+                output_episode_dir,
+            )
+
+        result.success = True
+        result.duration_s = time.time() - t_start
+
+    except Exception as exc:
+        result.error = str(exc)
+        result.duration_s = time.time() - t_start
+        logger.exception("Error processing episode %s: %s", episode_id, exc)
+
+    return result
+
+
+def stage_restructure_direct(
+    config: PipelineConfig,
+    episodes_with_trims: List[Tuple[DirectEpisodeInfo, int, int]],
+) -> PipelineReport:
+    """Restructure direct-mode episodes into the canonical output format."""
+    logger.info("Restructuring %d episodes...", len(episodes_with_trims))
+    report = PipelineReport(total_planned=len(episodes_with_trims))
+
+    # Per-(tissue, collector, phase, action) episode counter
+    episode_counters: Dict[Tuple[int, str, str, str], int] = defaultdict(int)
+
+    start_time = time.time()
+
+    for i, (ep, trim_start, trim_end) in enumerate(episodes_with_trims):
+        counter_key = (ep.tissue_num, ep.collector, ep.phase, ep.action)
+        episode_counters[counter_key] += 1
+        episode_index = episode_counters[counter_key]
+
+        # Build output path: dataset / tissue_N / [collector/] [phase/] action / episode_NNN
+        tissue_label = f"tissue_{ep.tissue_num}"
+        path_parts: List[str] = [tissue_label]
+        if ep.collector:
+            path_parts.append(ep.collector)
+        if ep.phase:
+            path_parts.append(ep.phase)
+        path_parts.append(ep.action)
+        path_parts.append(f"episode_{episode_index:03d}")
+
+        output_episode_dir = config.output_dir / config.dataset_name
+        for part in path_parts:
+            output_episode_dir = output_episode_dir / part
+
+        episode_id = str(
+            output_episode_dir.relative_to(
+                config.output_dir / config.dataset_name
+            )
+        )
+
+        logger.info(
+            "\n[%d/%d] Episode: %s  (frames %d–%d)",
+            i + 1,
+            len(episodes_with_trims),
+            episode_id,
+            trim_start,
+            trim_end,
+        )
+
+        result = _process_direct_episode(
+            config=config,
+            episode_info=ep,
+            trim_start=trim_start,
+            trim_end=trim_end,
+            output_episode_dir=output_episode_dir,
+            episode_id=episode_id,
+        )
+
+        report.episode_results.append(result)
+
+        if result.success:
+            report.total_processed += 1
+            report.total_frames_copied += result.num_frames
+            report.total_csv_rows += result.csv_rows
+            logger.info(
+                "[SUCCESS] %s — %d frames, %d CSV rows (%.1fs)",
+                episode_id,
+                result.num_frames,
+                result.csv_rows,
+                result.duration_s,
+            )
+        elif result.skipped:
+            report.total_skipped += 1
+            logger.warning("[SKIPPED] %s — %s", episode_id, result.error)
+        else:
+            report.total_errors += 1
+            logger.error("[ERROR] %s — %s", episode_id, result.error)
+
+    report.elapsed_s = time.time() - start_time
+    return report
+
+
+def run_pipeline_direct(config: PipelineConfig) -> PipelineReport:
+    """Execute the direct-mode restructuring pipeline.
+
+    Stages:
+        1. Filter & synchronise
+        2. Discover episodes (no annotation planning)
+        3. Trim stationary frames (optional)
+        4. Restructure
+    """
+    overall_start = time.time()
+
+    if not config.source_dir.exists():
+        raise ValueError(f"Source directory not found: {config.source_dir}")
+
+    n_stages = 3 if config.no_trim else 4
+    logger.info("=" * 60)
+    logger.info(
+        "Dataset Restructuring Pipeline — Direct Mode (%d stages)", n_stages
+    )
+    logger.info("  Source:      %s", config.source_dir)
+    logger.info("  Output:      %s", config.output_dir)
+    logger.info("  Dataset:     %s", config.dataset_name)
+    logger.info("  FPS:         %d", config.fps)
+    logger.info(
+        "  Trim:        %s",
+        "disabled" if config.no_trim else f"threshold={config.trim_threshold:.1e}",
+    )
+    logger.info("  Hardlink:    %s", config.use_hardlink)
+    logger.info("  Dry run:     %s", config.dry_run)
+    logger.info("=" * 60)
+
+    # ---------------------------------------------------------------
+    # Stage 1: Filter & synchronise
+    # ---------------------------------------------------------------
+    filtered_dir = stage_filter(config)
+
+    # ---------------------------------------------------------------
+    # Stage 2: Discover episodes
+    # ---------------------------------------------------------------
+    logger.info("Stage 2/%d: Discovering direct episodes...", n_stages)
+    episodes = _discover_direct_episodes(filtered_dir)
+
+    if not episodes:
+        raise RuntimeError(
+            "No episodes found. Verify the input directory contains "
+            "Tissue#N / collector / phase / action folders with camera "
+            "directories and ee_csv.csv."
+        )
+
+    # ---------------------------------------------------------------
+    # Stage 2.5: Trim stationary frames (optional)
+    # ---------------------------------------------------------------
+    trim_stats: Dict[str, int] = {}
+    if not config.no_trim:
+        stage_label = f"Stage 3/{n_stages}"
+        logger.info("%s: Trimming stationary frames...", stage_label)
+        episodes_with_trims, trim_stats = stage_trim_direct(
+            episodes, config.trim_threshold
+        )
+    else:
+        # No trim: use full frame ranges
+        episodes_with_trims = []
+        for ep in episodes:
+            left_dir = ep.source_dir / LEFT_IMG_DIR
+            frame_files = list_sorted_frames(
+                left_dir, CAMERA_SUFFIXES[LEFT_IMG_DIR]
+            )
+            n_frames = len(frame_files)
+            episodes_with_trims.append((ep, 0, max(0, n_frames - 1)))
+
+    # ---------------------------------------------------------------
+    # Stage 3/4: Restructure
+    # ---------------------------------------------------------------
+    final_stage = n_stages
+    logger.info("Stage %d/%d: Restructuring...", final_stage, n_stages)
+    report = stage_restructure_direct(config, episodes_with_trims)
+    report.trim_stats = trim_stats
+
+    # ---------------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------------
+    report.elapsed_s = time.time() - overall_start
+    _log_report(report)
+
+    return report
+
+
+# =============================================================================
 # MAIN PIPELINE
 # =============================================================================
 
@@ -860,12 +1380,21 @@ def stage_restructure(
 def run_pipeline(config: PipelineConfig) -> PipelineReport:
     """Execute the full restructuring pipeline.
 
+    Dispatches to the **direct** pipeline when ``config.annotations_dir``
+    is ``None``, or the **annotation** pipeline when it is set.
+
     Args:
         config: Pipeline configuration.
 
     Returns:
         PipelineReport with per-episode results and summary statistics.
     """
+    # ---------- Direct Mode ----------
+    if config.annotations_dir is None:
+        logger.info("No annotations directory provided — using Direct Mode.")
+        return run_pipeline_direct(config)
+
+    # ---------- Annotation Mode ----------
     overall_start = time.time()
 
     # Validate inputs early
@@ -878,7 +1407,7 @@ def run_pipeline(config: PipelineConfig) -> PipelineReport:
 
     n_stages = 3 if config.no_trim else 4
     logger.info("=" * 60)
-    logger.info("Dataset Restructuring Pipeline (%d stages)", n_stages)
+    logger.info("Dataset Restructuring Pipeline — Annotation Mode (%d stages)", n_stages)
     logger.info("  Source:      %s", config.source_dir)
     logger.info("  Annotations: %s", config.annotations_dir)
     logger.info("  Output:      %s", config.output_dir)
@@ -970,14 +1499,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Restructure and transform a surgical robot dataset into the "
-            "canonical directory format."
+            "canonical directory format.\n\n"
+            "Two modes are supported:\n"
+            "  Annotation Mode: provide --annotations-dir for JSON-based slicing.\n"
+            "  Direct Mode:     omit --annotations-dir when each action folder\n"
+            "                   is already a single episode (auto-detected)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Example usage:\n"
+            "Example usage (Annotation Mode):\n"
             "  python reformat_data.py \\\n"
             "    --input Cholecystectomy/tissues \\\n"
             "    --annotations-dir Cholecystectomy/annotations \\\n"
+            "    --output restructured_output\n"
+            "\n"
+            "Example usage (Direct Mode):\n"
+            "  python reformat_data.py \\\n"
+            "    --input Cholecystectomy \\\n"
             "    --output restructured_output\n"
         ),
     )
@@ -986,13 +1524,17 @@ def main() -> int:
         "--input",
         required=True,
         type=Path,
-        help="Path to raw data directory (e.g. Cholecystectomy/tissues).",
+        help="Path to raw data directory (e.g. Cholecystectomy).",
     )
     parser.add_argument(
         "--annotations-dir",
-        required=True,
+        required=False,
         type=Path,
-        help="Path to annotations directory (e.g. Cholecystectomy/annotations).",
+        default=None,
+        help=(
+            "Path to annotations directory for annotation-based slicing. "
+            "If omitted, Direct Mode is used (each action folder = 1 episode)."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -1052,14 +1594,16 @@ def main() -> int:
         logger.error("Source directory not found: %s", args.input)
         return 1
 
-    if not args.annotations_dir.exists():
-        logger.error("Annotations directory not found: %s", args.annotations_dir)
+    if args.annotations_dir is not None and not args.annotations_dir.exists():
+        logger.error(
+            "Annotations directory not found: %s", args.annotations_dir
+        )
         return 1
 
     config = PipelineConfig(
         source_dir=args.input,
-        annotations_dir=args.annotations_dir,
         output_dir=args.output,
+        annotations_dir=args.annotations_dir,
         dataset_name=args.dataset_name,
         fps=args.fps,
         workers=args.workers,
