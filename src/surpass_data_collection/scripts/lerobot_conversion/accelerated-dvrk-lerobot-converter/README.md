@@ -1,15 +1,16 @@
 # DVRK to LeRobot Converter GUIs
 
-This module provides two GUI tools to convert DVRK surgical robot datasets into HuggingFace LeRobot formats with nanosecond-precision timestamp alignment across multiple camera views.
+This module provides tools to convert DVRK surgical robot datasets into HuggingFace LeRobot formats with nanosecond-precision timestamp alignment across multiple camera views.
 
-Two versions are provided to support different LeRobot versions and pipeline requirements:
+Three versions are provided to support different LeRobot versions and pipeline requirements:
 
-1. `dvrk_lerobot_converter_gui.py`: Built for **LeRobot v3.0 (v0.4.3)**. Supports direct ingestion of filtered affordance slices via `slice_affordance.py` annotations, skipping physical intermediate file copies.
-2. `dvrk_lerobot_converter_gui_v2.1.py`: Built for **LeRobot v2.1**. A legacy flattener that expects a pre-copied `episode_xxx/` structure.
+1. `dvrk_lerobot_converter_v2.1.py`: Built for **LeRobot v2.1** as a **Command Line Interface (CLI)** tool. Serves as the primary programmatic entry point for accelerated conversion datasets in our pipeline.
+2. `dvrk_lerobot_converter_gui.py`: Built for **LeRobot v3.0 (v0.4.3)** as a GUI. Supports direct ingestion of filtered affordance slices via `slice_affordance.py` annotations, skipping physical intermediate file copies.
+3. `dvrk_lerobot_converter_gui_v2.1.py`: Built for **LeRobot v2.1** as a GUI. A legacy flattener that expects a pre-copied `episode_xxx/` structure.
 
 ## Features
 
-- **PyQt5 GUI**: No command-line arguments needed
+- **CLI & GUI options**: Run headless on remote clusters using the CLI or intuitively via PyQt5 GUIs.
 - **Multi-camera Sync**: Timestamp-based alignment across 4 streams (left/right endoscope, left/right wrist)
 - **Extreme Encoding Optimization**: Pre-places uncompressed camera JPEGs via hardlinks into fast NVMe caching (`TEMP_IMAGE_DIR`) to bypass Python decode/encode bottlenecks—letting FFmpeg crunch raw bytes natively.
 - **NVIDIA GPU Acceleration**: Native bindings for GPU video decoding/encoding inside LeRobot processes
@@ -79,7 +80,17 @@ pip install -r requirements.txt
 
 ## Usage
 
-**For the v3.0 Annotated Pipeline:**
+**For the v2.1 CLI pipeline (Recommended for Automation):**
+
+```bash
+python dvrk_lerobot_converter_v2.1.py \
+  --source-dir <insert_path_to_dvrk_data> \
+  --annotations-dir <insert_path_to_annotations> \
+  --dataset-name <insert_dataset_name> \
+  --overwrite
+```
+
+**For the v3.0 Annotated Pipeline (GUI):**
 
 ```bash
 python dvrk_lerobot_converter_gui.py

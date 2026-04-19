@@ -17,9 +17,11 @@ After synchronization and action-based slicing, datasets need to be reformatted 
 
 ```
 post_processing/
-├── reformat_data.py         # Normalize timestamps and rename frames
-├── slice_affordance.py      # Slice sessions into action-based episodes
-└── README.md                # This file
+├── reformat_data.py               # Normalize timestamps and rename frames
+├── slice_affordance.py            # Slice sessions into action-based episodes
+├── analyze_trim_threshold.py      # Diagnostic tool to calculate and visualize trim thresholds
+├── remove_stationary_frames.py    # Script to trim leading/trailing stationary frames from sliced episodes
+└── README.md                      # This file
 ```
 
 ---
@@ -157,6 +159,65 @@ dataset_sliced/
 
 ---
 
+### analyze_trim_threshold.py
+
+**Purpose**: A diagnostic tool used to determine the optimal movement threshold for trimming stationary frames at the beginning and end of episodes.
+
+**Key Features**:
+- Evaluates kinematic data across multiple threshold values.
+- Plots total movement and proportion of trimmed frames to help identify the optimal noise threshold.
+- Aids in distinguishing between actual intentional robot actions and noise jitter.
+- Can run over multiple sessions to provide dataset-wide recommendations.
+
+**Use Cases**:
+- Tuning the stationary trimming parameters for the dataset.
+- Identifying anomalous episodes with continuous motion.
+
+**Programmatic Usage**:
+
+```python
+from analyze_trim_threshold import analyze_directory
+
+# Analyze a directory with multiple threshold values
+results = analyze_directory("filtered_data", thresholds=[1e-5, 1e-4, 1e-3, 1e-2])
+print(results)
+```
+
+**Command-Line Interface**:
+```bash
+python analyze_trim_threshold.py /path/to/data
+```
+
+---
+
+### remove_stationary_frames.py
+
+**Purpose**: Trims stationary (non-moving) frames from the beginning and end of each sliced episode to ensure the dataset strictly contains actionable movements.
+
+**Key Features**:
+- Calculates position and orientation deltas from the kinematics CSV.
+- Automatically detects and trims leading and trailing stationary blocks based on a configured `theta` threshold.
+- Directly modifies the input directory in-place (removes trimmed images and CSV rows).
+- Designed for speed with minimal memory footprint.
+
+**Use Cases**:
+- Post-processing affordance slices before packaging them into LeRobot datasets.
+- Cleaning up padding or delays caused by human operator reaction time.
+
+**Programmatic Usage**:
+
+```python
+from remove_stationary_frames import process_all_episodes
+from pathlib import Path
+
+# Trims stationary frames from all episodes within a dataset directory
+stats = process_all_episodes(Path("dataset_sliced"), threshold=1e-4)
+
+print(f"Total Trimmed: {stats['trimmed_episodes']} / {stats['total_episodes']}")
+```
+
+---
+
 ### slice_affordance.py
 
 **Purpose**: Provide annotation parsing and episode planning utilities for downstream conversion pipelines.
@@ -239,20 +300,17 @@ The recommended processing sequence for post-processing:
 python ../sync_image_kinematics/filter_episodes.py /raw_data /filtered_data
 
 # Step 2: Slice into action-based episodes
-python slice_affordance.py \
-    --source_dataset_dir filtered_data \
-    --out_dir dataset_sliced \
-    --hardlink
+# Currently typically driven by integration in dvrk_zarr_to_lerobot.py instead of directly
 
-# Step 3: Normalize timestamps and frame names
+# Step 3: Trim stationary frames
+python remove_stationary_frames.py dataset_sliced --threshold 1e-4
+
+# Step 4: Normalize timestamps and frame names
 python reformat_data.py \
     --data-path dataset_sliced \
     --rename-folders \
     --new-name cholecystectomy \
     --workers 8
-
-# Alternative: Combine steps 2 and 3
-python slice_affordance.py --source_dataset_dir filtered_data --reformat
 ```
 
 ---

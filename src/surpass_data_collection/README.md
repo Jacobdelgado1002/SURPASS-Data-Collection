@@ -20,15 +20,18 @@ The pipeline transforms raw data collection sessions into training-ready dataset
 src/
 ├── logger_config.py              # Centralized logging configuration
 ├── scripts/                      # Main processing scripts organized by function
+│   ├── lerobot_conversion/       # LeRobot dataset construction and CLI/GUI conversion suites
 │   ├── post_processing/          # Dataset reformatting and action-based slicing
 │   │   ├── reformat_data.py
 │   │   └── slice_affordance.py
 │   ├── sync_image_kinematics/    # Temporal synchronization and filtering
 │   │   ├── filter_episodes.py
 │   │   └── sync_image_kinematics.py
-│   └── video_processing/         # Frame-to-video conversion utilities
-│       ├── frames_to_vids.py
-│       └── merge_actions_to_vids.py
+│   ├── validation/               # Validation scripts for checking dataset integrity
+│   ├── video_processing/         # Frame-to-video conversion utilities
+│   │   ├── frames_to_vids.py
+│   │   └── merge_actions_to_vids.py
+│   └── visualization/            # Dataset visualization and debugging tools
 └── README.md                     # This file
 ```
 
@@ -83,6 +86,30 @@ Handles temporal synchronization between camera frames and kinematic data, plus 
 
 ---
 
+### scripts/lerobot_conversion/
+
+Contains pipelines and accelerated conversion utilities to package processed robotic data into Hugging Face LeRobot format.
+
+**See [scripts/lerobot_conversion/README.md](scripts/lerobot_conversion/README.md) for detailed documentation.**
+
+---
+
+### scripts/validation/
+
+Utility scripts that validate multi-view alignment and structure of Open-H and SURPASS robotics datasets.
+
+**See [scripts/validation/README.md](scripts/validation/README.md) for detailed documentation.**
+
+---
+
+### scripts/visualization/
+
+Tools for inspecting Hugging Face datasets and verifying the output of the whole pipeline intuitively.
+
+**See [scripts/visualization/README.md](scripts/visualization/README.md) for detailed documentation.**
+
+---
+
 ### scripts/video_processing/
 
 Utilities for converting image frame sequences into video files for visualization and storage.
@@ -125,13 +152,19 @@ python -m surpass_data_collection.scripts.sync_image_kinematics.filter_episodes.
 python -m surpass_data_collection.scripts.post_processing.slice_affordance --post_process_dir ../Data/Cholecystectomy/post_annotation/ --cautery_dir ../Filtered_Data/Cholecystectomy/tissues --out_dir ../Filtered_Data/Cholecystectomy/tissues_sliced
 ```
 
-#### 3. **Reformat for Training** (After slicing)
+#### 3. **Reformat for Training (Optional)** 
 ```bash
 # Normalize timestamps and rename frames
 python -m surpass_data_collection.scripts.post_processing.reformat_data --data-path ../Filtered_Data/Cholecystectomy/tissues_sliced
 ```
 
-#### 4. **Generate Videos** (Optional - for visualization)
+#### 4. **Convert to LeRobot** (Final Dataset Stage)
+```bash
+# Convert dataset to huggingface LeRobot v2.1 format
+python -m surpass_data_collection.scripts.lerobot_conversion.accelerated-dvrk-lerobot-converter.dvrk_lerobot_converter_v2.1 --source-dir ../Filtered_Data/Cholecystectomy/tissues_sliced --dataset-name my_lerobot_dataset
+```
+
+#### 5. **Generate Videos** (Optional - for visualization)
 ```bash
 # Convert frames to videos
 python src/scripts/video_processing/frames_to_vids.py --root_dir cautery
@@ -242,7 +275,9 @@ Synchronized Dataset
         ↓
 Sliced Dataset
         ↓
-[reformat_data.py]             ← Normalize timestamps & frame names
+[reformat_data.py]             ← Normalize timestamps & frame names (Optional)
+        ↓
+    [LeRobot Converter]        ← Package into LeRobot .parquet + .mp4 formats
         ↓
 Training-Ready Dataset
 ```
@@ -353,9 +388,12 @@ When adding new processing scripts:
 ## Additional Resources
 
 - **Main Project README**: `../README.md`
+- **LeRobot Conversion Documentation**: `scripts/lerobot_conversion/README.md`
 - **Post-processing Documentation**: `scripts/post_processing/README.md`
 - **Synchronization Documentation**: `scripts/sync_image_kinematics/README.md`
+- **Validation Documentation**: `scripts/validation/README.md`
 - **Video Processing Documentation**: `scripts/video_processing/README.md`
+- **Visualization Documentation**: `scripts/visualization/README.md`
 
 ---
 
